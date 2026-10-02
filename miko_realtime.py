@@ -1247,6 +1247,11 @@ class NativeSession:
                 if is_final:
                     self.state.text_presented(item)
             return
+        if kind == 'vision_preview':
+            # "What Miko sees" live view (local only, never sent to a model).
+            if self.hub.vision and hasattr(self.hub.vision, 'set_preview') and not self.device_id:
+                self.hub.vision.set_preview(bool(event.get('enabled')))
+            return
         if kind == 'vision_toggle':
             if self.hub.vision and not self.device_id:
                 await asyncio.to_thread(self.hub.vision.set_enabled, bool(event.get('enabled')))

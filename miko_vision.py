@@ -145,6 +145,9 @@ class VisionEngine:
         self._jolt_flip = False
         self._hand_boxes: list = []
         self._blob_box = None
+        self._prev_t: float | None = None
+        self.fast_frames = 0
+        self.slow_frames = 0
         self._last_motion = -1e9
         self._last_light = -1e9
         self._face_change_at = -1e9
@@ -194,40 +197,83 @@ class VisionEngine:
         return min(faces, key=lambda f: (f.cx - s.cx) ** 2 + (f.cy - s.cy) ** 2 - 0.05 * f.w)
 
     # ------------------------------------------------------------ main step
-    def process(self, frame, now: float | None = None) -> list[dict[str, Any]]:
-        """Analyse one BGR frame; returns new events (dicts with 'event')."""
-        now = time.monotonic() if now is None else now
-        out: list[dict[str, Any]] = []
-        h, w = frame.shape[:2]
-        gray = cv2.cvtColor(cv2.resize(frame, (FLOW_WIDTH, max(1, int(round(h * FLOW_WIDTH / float(w))))),
-                                       interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-        out.extend(self._scene_step(gray, now))
-        if self.covered:
-            # A hand over the lens is not the owner leaving.
-            self._last_face_at = now if self.seen else self._last_face_at
-            self._prev_gray = None
-            self._bg = None
-            return out
+    #
+    # Two lanes. The fast lane (cover/light, device motion, shakes, motion
+    # waves, room changes) is cheap and runs on every camera frame. The slow
+    # lane (faces, MediaPipe expressions and hands) is heavy and runs as fast
+    # as the computer allows on the newest frame. Before, everything ran in
+    # one chain at the slow lane's pace (4-6 fps on many laptops), and a
+    # 2-4 per second wave or shake simply fell between frames.
 
-        rich: list[dict[str, Any]] = []
-        obs = None
-        # Presence and position: the OpenCV detector finds faces at any
-        # distance. MediaPipe adds expressions/gaze/hands when it sees them.
+    def _gray(self, frame):
+        h, w = frame.shape[:2]
+        return cv2.cvtColor(cv2.resize(frame, (FLOW_WIDTH, max(1, int(round(h * FLOW_WIDTH / float(w))))),
+                                       interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+
+    def process(self, frame, now: float | None = None) -> list[dict[str, Any]]:
+        """Both lanes on one frame, in order (device frames, tests)."""
+        now = time.monotonic() if now is None else now
+        gray = self._gray(frame)
+        out = self._scene_step(gray, now)
+        if self._covered_reset(now):
+            return out
+        out.extend(self.apply_slow(self.analyze_slow(frame, now), now))
+        out.extend(self._fast_motion(gray, now))
+        return out
+
+    def process_fast(self, frame, now: float | None = None) -> list[dict[str, Any]]:
+        """Fast lane only (call on every camera frame)."""
+        now = time.monotonic() if now is None else now
+        self.fast_frames += 1
+        gray = self._gray(frame)
+        out = self._scene_step(gray, now)
+        if self._covered_reset(now):
+            return out
+        out.extend(self._fast_motion(gray, now))
+        return out
+
+    def _covered_reset(self, now: float) -> bool:
+        if not self.covered:
+            return False
+        # A hand over the lens is not the owner leaving.
+        self._last_face_at = now if self.seen else self._last_face_at
+        self._prev_gray = None
+        self._bg = None
+        return True
+
+    def analyze_slow(self, frame, now: float) -> dict[str, Any]:
+        """Heavy detection (YuNet, MediaPipe). Touches only the detectors, so
+        the live service runs it outside the engine lock."""
+        h, w = frame.shape[:2]
         scale = PROCESS_WIDTH / float(w)
         small = cv2.resize(frame, (PROCESS_WIDTH, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
         detected = self._detect(small)
+        obs = None
         if self.mp is not None:
             started = time.perf_counter()
             obs = self.mp.process(frame, now)
-            if obs.hands_checked:
-                # Hands are not the room either: a hand waving close to the
-                # camera must not look like the camera moving.
-                self._hand_boxes = [self._hand_box(h) for h in obs.hands]
             self._cost.append(time.perf_counter() - started)
             # Slow machine: look at hands every other frame to keep the pace.
             if len(self._cost) == self._cost.maxlen:
                 average = sum(self._cost) / len(self._cost)
                 self.mp.hand_every = 2 if average > 0.075 else (1 if average < 0.045 else self.mp.hand_every)
+        return {"detected": detected, "obs": obs}
+
+    def apply_slow(self, result: dict[str, Any], now: float) -> list[dict[str, Any]]:
+        """Presence, expressions, hand signs and hand waves from a slow-lane
+        detection (call under the engine lock)."""
+        self.slow_frames += 1
+        out: list[dict[str, Any]] = []
+        if self.covered:
+            self._last_face_at = now if self.seen else self._last_face_at
+            return out
+        detected, obs = result["detected"], result["obs"]
+        rich: list[dict[str, Any]] = []
+        if obs is not None:
+            if obs.hands_checked:
+                # Hands are not the room either: a hand waving close to the
+                # camera must not look like the camera moving.
+                self._hand_boxes = [self._hand_box(h) for h in obs.hands]
             if not detected:
                 detected = [_Face(f.cx, f.cy, f.w, f.h, 1.0, abs(f.yaw) < 18) for f in obs.faces]
             face = self._pick(detected)
@@ -260,8 +306,9 @@ class VisionEngine:
             self.face = self._smooth
             if not self.seen and self._streak >= PRESENT_AFTER:
                 self.seen = True
-                if not self._ever_seen or now - self._absent_since >= ARRIVE_AFTER_ABSENCE_S:
-                    out.append(self._event(now, "arrived"))
+                away = now - self._absent_since if self._ever_seen else 1e6
+                if not self._ever_seen or away >= ARRIVE_AFTER_ABSENCE_S:
+                    out.append(self._event(now, "arrived", away=round(min(away, 1e6))))
                 self._ever_seen = True
         else:
             self._streak = 0
@@ -271,10 +318,6 @@ class VisionEngine:
                 self.face = None
                 self._smooth = None
                 out.append(self._event(now, "left"))
-
-        # Device / camera motion first: it decides whether the rest of the
-        # scene-relative perception can be trusted on this frame.
-        out.extend(self._motion_step(gray, now))
         stable = self.camera_stable
         if self.seen and self.face is not None and self.mp is None and stable:
             out.extend(self._attention_step(now))
@@ -287,9 +330,6 @@ class VisionEngine:
             self._size_hist.clear()
         if obs is not None and obs.hands_checked:
             out.extend(self._hand_wave_step(obs.hands, now, stable))
-        out.extend(self._scene_change_step(gray, now))
-        if not stable and self.face_analyzer is not None:
-            self.face_analyzer.camera_moved()
         for event in rich:
             name = event.pop("event")
             if not stable and name in POSE_EVENTS:
@@ -297,6 +337,15 @@ class VisionEngine:
                           suppression="camera_or_device_moving")
                 continue
             out.append(self._event(now, name, **event))
+        return out
+
+    def _fast_motion(self, gray, now: float) -> list[dict[str, Any]]:
+        # Device / camera motion first: it decides whether scene-relative
+        # perception can be trusted.
+        out = self._motion_step(gray, now)
+        out.extend(self._scene_change_step(gray, now))
+        if not self.camera_stable and self.face_analyzer is not None:
+            self.face_analyzer.camera_moved()
         return out
 
     @staticmethod
@@ -533,11 +582,17 @@ class VisionEngine:
         """Device/camera motion (physical episodes), then waves and other
         movement relative to a steady background."""
         prev, self._prev_gray = self._prev_gray, gray
+        prev_t, self._prev_t = self._prev_t, now
         if prev is None or prev.shape != gray.shape:
             return []
         H, W = gray.shape
         out = []
+        # Thresholds are in "pixels per 1/15 s": scale by the real frame
+        # interval so 30 fps and 6 fps cameras measure the same motion.
+        dt = (now - prev_t) if prev_t is not None else 1.0 / 15.0
+        per15 = max(0.25, min(4.0, (1.0 / 15.0) / max(dt, 1e-3)))
         vector, quality = self._global_motion(prev, gray)
+        vector = (vector[0] * per15, vector[1] * per15)
         physical = self.physical.update(now, vector, quality)
         if now < self.imu_active_until:
             # The device IMU measures its own motion better than the camera;
@@ -565,7 +620,7 @@ class VisionEngine:
         local_x = flow[..., 0] - gx
         local_y = flow[..., 1] - gy
         local = np.hypot(local_x, local_y)
-        moving = local > 1.2
+        moving = local > 1.2 / per15
         f = self.face if self.seen else None
         if f is not None:
             # Head movement is not a gesture: ignore the face box.
@@ -599,9 +654,11 @@ class VisionEngine:
                         if abs(vx) > 0.9 * vy:            # mostly sideways
                             bx, by = float(centers[index][0]) / W, float(centers[index][1]) / H
                             sample = HandSample(now, bx, by, 0.1, -1.0, "", bx)
-        # Fast waves blur, and the hand model then loses the hand: flow may
-        # confirm when there is no hand model, or a hand was seen just now.
-        self.flow_wave.can_confirm = self.mp is None or now - self._hand_seen_at < 2.5
+        # Fast waves blur, and the hand model then loses the hand (or runs
+        # slowly on this computer). Flow may confirm; without a hand seen just
+        # now it needs stronger evidence.
+        self.flow_wave.can_confirm = True
+        self.flow_wave.confirm_at = 0.8 if (self.mp is None or now - self._hand_seen_at < 2.5) else 0.86
         events = self.flow_wave.update(now, sample, self._face_sample(now), camera_stable=True)
         for event in events:
             out.append(self._event(now, event.pop("event"), **event))
@@ -671,6 +728,14 @@ class VisionService:
         self._last_state: dict[str, Any] = {}
         self._device_frames_at = 0.0
         self._imu: ImuInterpreter | None = None
+        self._slow_frame = None
+        self._slow_ready = threading.Event()
+        self.preview_enabled = False
+        self._preview_at = 0.0
+        self._fast_at = 0.0
+        self._slow_at = 0.0
+        self._fps_fast = 0.0
+        self._fps_slow = 0.0
 
     def _load_enabled(self) -> bool:
         if os.environ.get("MIKO_VISION", "").strip() == "0":
@@ -796,6 +861,8 @@ class VisionService:
         errors = 0
         frames = 0
         beat_at = time.monotonic()
+        lane_stop = threading.Event()
+        threading.Thread(target=self._slow_lane, args=(lane_stop,), name="MikoVisionSlowLane", daemon=True).start()
         try:
             next_at = 0.0
             while not self._stop.is_set():
@@ -819,9 +886,9 @@ class VisionService:
                 now = time.monotonic()
                 if now < next_at:
                     continue
-                next_at = now + 0.06                    # ~15 fps analysis (waves are fast)
+                next_at = now + 0.03                    # fast lane: up to ~30 fps (cheap)
                 try:
-                    self.feed_frame(frame, now)
+                    self._fast_lane(frame, now)
                     frames += 1
                 except Exception as error:
                     # One bad frame must never kill sight for the rest of the
@@ -831,12 +898,60 @@ class VisionService:
                     throttled("vision_frame_error", 10.0, "RECOVERY", "frame analysis failed; camera keeps running",
                               error=type(error).__name__, where=traceback.format_exc().strip().splitlines()[-2].strip()[:120])
         finally:
+            lane_stop.set()
+            self._slow_ready.set()
             capture.release()
             if self.source == "webcam":
                 self.source = "off"
         if not self._stop.is_set():
             self._thread = None
             self._start_webcam()
+
+    def _fast_lane(self, frame, now: float) -> None:
+        if self._fast_at:
+            self._fps_fast += (1.0 / max(now - self._fast_at, 1e-3) - self._fps_fast) * 0.1
+        self._fast_at = now
+        with self.lock:
+            engine = self.engine
+            if engine is None:
+                return
+            events = engine.process_fast(frame, now)
+            state = engine.state()
+        # Hand the newest frame to the slow lane (older ones are dropped).
+        self._slow_frame = (frame, now)
+        self._slow_ready.set()
+        self._publish(events)
+        self._emit_state(state, now)
+        self._maybe_preview(frame, now)
+
+    def _slow_lane(self, stop: threading.Event) -> None:
+        """Faces, expressions and hands on the newest frame, as fast as the
+        computer allows, without ever holding up the fast lane."""
+        while not stop.is_set() and not self._stop.is_set():
+            self._slow_ready.wait(1.0)
+            self._slow_ready.clear()
+            item, self._slow_frame = self._slow_frame, None
+            if item is None:
+                continue
+            frame, now = item
+            engine = self.engine
+            if engine is None:
+                continue
+            try:
+                result = engine.analyze_slow(frame, now)          # heavy, outside the lock
+                done = time.monotonic()
+                if self._slow_at:
+                    self._fps_slow += (1.0 / max(done - self._slow_at, 1e-3) - self._fps_slow) * 0.2
+                self._slow_at = done
+                with self.lock:
+                    if self.engine is not engine:
+                        continue
+                    events = engine.apply_slow(result, now)
+                self._publish(events)
+            except Exception as error:
+                import traceback
+                throttled("vision_slow_error", 10.0, "RECOVERY", "face/hand analysis failed; sight keeps running",
+                          error=type(error).__name__, where=traceback.format_exc().strip().splitlines()[-2].strip()[:120])
 
     def feed_jpeg(self, jpeg: bytes) -> None:
         """Frame from the paired device camera (in memory only)."""
@@ -859,7 +974,8 @@ class VisionService:
             stable = bool(engine.camera_stable) if engine else False
             mp = bool(engine and engine.mp)
             energy = round(engine.physical.energy, 2) if engine else 0.0
-        log("PERCEPTION", "sight heartbeat", fps=round(frames / max(seconds, 0.1), 1), face_seen=seen,
+        log("PERCEPTION", "sight heartbeat", fps=round(frames / max(seconds, 0.1), 1),
+            fast_fps=round(self._fps_fast, 1), slow_fps=round(self._fps_slow, 1), face_seen=seen,
             camera_steady=stable, motion_energy=energy, mediapipe=mp, errors=errors, source=self.source)
 
     def feed_imu(self, samples, now: float | None = None) -> None:
@@ -904,11 +1020,92 @@ class VisionService:
             events = self.engine.process(frame, now)
             state = self.engine.state()
         self._publish(events)
+        self._emit_state(state, now)
+        self._maybe_preview(frame, now)
+
+    def _emit_state(self, state: dict[str, Any], now: float) -> None:
         changed = state.get("seen") != self._last_state.get("seen")
         if changed or now - self._last_state_at >= STATE_INTERVAL_S:
             self._last_state_at = now
             self._last_state = state
             self.emit(state)
+
+    def set_preview(self, enabled: bool) -> None:
+        self.preview_enabled = bool(enabled)
+        log("PERCEPTION", "live view " + ("on" if self.preview_enabled else "off"))
+
+    def _maybe_preview(self, frame, now: float) -> None:
+        """'What Miko sees' (F6): the camera picture with what was measured on
+        it, ~5 times a second, as a small JPEG for Godot. Local only."""
+        if not self.preview_enabled or now - self._preview_at < 0.2:
+            return
+        self._preview_at = now
+        try:
+            with self.lock:
+                engine = self.engine
+                if engine is None:
+                    return
+                info = self._preview_info(engine, now)
+            image = self._draw_preview(frame, info)
+            ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 62])
+            if ok:
+                import base64
+                self.emit({"type": "vision_preview", "jpeg": base64.b64encode(jpeg.tobytes()).decode("ascii")})
+        except Exception as error:
+            throttled("vision_preview_error", 10.0, "RECOVERY", "live view failed", error=type(error).__name__)
+
+    def _preview_info(self, engine, now: float) -> dict[str, Any]:
+        hand_e, flow_e = engine.hand_wave.last_evidence, engine.flow_wave.last_evidence
+        wave = max((e for e in (hand_e, flow_e) if e), key=lambda e: e.get("confidence", 0.0), default={})
+        p = engine.physical
+        return {
+            "face": engine.face if engine.seen else None, "hands": list(engine._hand_boxes),
+            "blob": engine._blob_box, "covered": engine.covered, "steady": engine.camera_stable,
+            "energy": p.energy, "episode": bool(p.episode), "shaking": p.shaking,
+            "start": p.p.start, "peak": p.p.shake_peak, "wave": dict(wave),
+            "fast": self._fps_fast, "slow": self._fps_slow, "mediapipe": engine.mp is not None,
+            "events": [(round(now - t, 1), n) for t, n, _ in list(engine.events)[-4:] if now - t < 8.0],
+        }
+
+    @staticmethod
+    def _draw_preview(frame, info: dict[str, Any]):
+        h, w = frame.shape[:2]
+        W = 320
+        H = int(round(h * W / float(w)))
+        img = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
+        img = cv2.flip(img, 1)                         # mirror, like a selfie camera
+
+        def rect(box, color, thick=2):
+            x0, y0, x1, y1 = box
+            cv2.rectangle(img, (int((1 - x1) * W), int(y0 * H)), (int((1 - x0) * W), int(y1 * H)), color, thick)
+        f = info["face"]
+        if f is not None:
+            rect((f.cx - f.w / 2, f.cy - f.h / 2, f.cx + f.w / 2, f.cy + f.h / 2), (90, 220, 90))
+        for box in info["hands"]:
+            rect(box, (40, 200, 255))
+        if info["blob"]:
+            rect(info["blob"], (255, 200, 60), 1)
+        # Top bar: lanes and camera state.
+        cv2.rectangle(img, (0, 0), (W, 18), (20, 20, 20), -1)
+        state = "COVERED" if info["covered"] else ("steady" if info["steady"] else "CAMERA MOVING")
+        text = f"fast {info['fast']:.0f}fps  slow {info['slow']:.0f}fps  {'MP' if info['mediapipe'] else 'cv'}  {state}"
+        cv2.putText(img, text, (4, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 235, 235), 1, cv2.LINE_AA)
+        # Motion meter (device / camera shake).
+        cv2.rectangle(img, (0, H - 34), (W, H), (20, 20, 20), -1)
+        level = min(1.0, info["energy"] / max(info["peak"] * 1.5, 1e-3))
+        color = (60, 60, 255) if info["shaking"] else ((0, 170, 255) if info["episode"] else (120, 200, 120))
+        cv2.rectangle(img, (4, H - 30), (4 + int((W - 8) * level), H - 22), color, -1)
+        mark = 4 + int((W - 8) * min(1.0, info["start"] / max(info["peak"] * 1.5, 1e-3)))
+        cv2.line(img, (mark, H - 32), (mark, H - 20), (255, 255, 255), 1)
+        wave = info["wave"]
+        wtext = "wave: -" if not wave else (f"wave {wave.get('confidence', 0):.2f} swings {wave.get('swings', 0)} "
+                                             f"open {wave.get('openness', 0):.1f}")
+        cv2.putText(img, ("SHAKING  " if info["shaking"] else "") + wtext, (4, H - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38, (235, 235, 235), 1, cv2.LINE_AA)
+        for i, (age, name) in enumerate(reversed(info["events"])):
+            cv2.putText(img, f"{name} {age}s", (W - 120, 34 + 14 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        (90, 255, 255), 1, cv2.LINE_AA)
+        return img
 
 
 class VisionProcess:
@@ -1025,6 +1222,9 @@ class VisionProcess:
     def status_event(self) -> dict[str, Any]:
         return {"type": "vision_status", "enabled": self.enabled, "source": self.source,
                 "available": available(), "error": self.error}
+
+    def set_preview(self, enabled: bool) -> None:
+        self._send({"c": "preview", "v": bool(enabled)})
 
     def summary(self) -> dict[str, Any]:
         if not self.enabled:

@@ -50,11 +50,11 @@ class Profile:
 # Event kinds as the host sees them ("gesture:<name>" for hand signs).
 PROFILES: dict[str, Profile] = {
     "wave": Profile(SHORT_VOCAL, "HIGH_CONFIDENCE_GESTURE", 60, 0.6, 0.8, "greeting"),
-    "arrived": Profile(SHORT_VOCAL, "CONVERSATION_GESTURE", 120, 0.7, 0.0, "greeting"),
+    "arrived": Profile(SHORT_VOCAL, "CONVERSATION_GESTURE", 600, 0.6, 0.0, "greeting"),
     "left": Profile(MICRO, "AUTONOMOUS", family="presence"),
     "approached": Profile(FACIAL, "AUTONOMOUS", family="presence"),
     "covered": Profile(SHORT_VOCAL, "STRONG_PHYSICAL", 45, 0.55, 0.0, "covered"),
-    "uncovered": Profile(SHORT_VOCAL, "STRONG_PHYSICAL", 45, 0.4, 0.0, "covered"),
+    "uncovered": Profile(SHORT_VOCAL, "STRONG_PHYSICAL", 90, 0.3, 0.0, "covered"),
     "shake_started": Profile(ANIMATION_ONLY, "STRONG_PHYSICAL", family="physical"),
     "shake_active": Profile(MICRO, "STRONG_PHYSICAL", family="physical"),
     "shake_ended": Profile(SHORT_VOCAL, "STRONG_PHYSICAL", 60, 0.75, 0.0, "physical"),
@@ -62,12 +62,12 @@ PROFILES: dict[str, Profile] = {
     "orientation_changed": Profile(SHORT_VOCAL, "STRONG_PHYSICAL", 90, 0.5, 0.0, "physical"),
     "device_moved": Profile(MICRO, "AUTONOMOUS", family="physical_minor"),
     "device_nudged": Profile(MICRO, "IDLE", family="physical_minor"),
-    "laughing": Profile(SHORT_VOCAL, "CONVERSATION_GESTURE", 90, 0.35, 0.0, "emotion"),
+    "laughing": Profile(ANIMATION_ONLY, "CONVERSATION_GESTURE", family="emotion"),
     "smiled": Profile(FACIAL, "CONVERSATION_GESTURE", family="emotion"),
     "surprised": Profile(FACIAL, "CONVERSATION_GESTURE", family="emotion"),
-    "frowned": Profile(SHORT_VOCAL, "CONVERSATION_GESTURE", 300, 0.45, 0.0, "emotion"),
-    "yawned": Profile(SHORT_VOCAL, "AUTONOMOUS", 240, 0.35, 0.0, "emotion"),
-    "winked": Profile(SHORT_VOCAL, "CONVERSATION_GESTURE", 120, 0.4, 0.0, "emotion"),
+    "frowned": Profile(FACIAL, "CONVERSATION_GESTURE", family="emotion"),
+    "yawned": Profile(ANIMATION_ONLY, "AUTONOMOUS", family="emotion"),
+    "winked": Profile(FACIAL, "CONVERSATION_GESTURE", family="emotion"),
     "eyes_closed": Profile(FACIAL, "AUTONOMOUS", family="attention"),
     "eyes_opened": Profile(MICRO, "AUTONOMOUS", family="attention"),
     "looked_at_miko": Profile(FACIAL, "CONVERSATION_GESTURE", family="attention"),
@@ -81,9 +81,9 @@ PROFILES: dict[str, Profile] = {
     "light_changed": Profile(MICRO, "AUTONOMOUS", family="room"),
     "scene_changed": Profile(MICRO, "AUTONOMOUS", family="room"),
     "motion": Profile(MICRO, "AUTONOMOUS", family="room"),
-    "gesture:thumbs_up": Profile(SHORT_VOCAL, "HIGH_CONFIDENCE_GESTURE", 90, 0.45, 0.0, "hand_sign"),
-    "gesture:thumbs_down": Profile(SHORT_VOCAL, "HIGH_CONFIDENCE_GESTURE", 90, 0.5, 0.0, "hand_sign"),
-    "gesture:peace": Profile(SHORT_VOCAL, "HIGH_CONFIDENCE_GESTURE", 90, 0.4, 0.0, "hand_sign"),
+    "gesture:thumbs_up": Profile(SHORT_VOCAL, "HIGH_CONFIDENCE_GESTURE", 180, 0.35, 0.0, "hand_sign"),
+    "gesture:thumbs_down": Profile(ANIMATION_ONLY, "HIGH_CONFIDENCE_GESTURE", family="hand_sign"),
+    "gesture:peace": Profile(ANIMATION_ONLY, "HIGH_CONFIDENCE_GESTURE", family="hand_sign"),
     "gesture:love": Profile(SHORT_VOCAL, "HIGH_CONFIDENCE_GESTURE", 120, 0.7, 0.0, "hand_sign"),
     "gesture:fist": Profile(ANIMATION_ONLY, "HIGH_CONFIDENCE_GESTURE", family="hand_sign"),
     "gesture:open_palm": Profile(ANIMATION_ONLY, "HIGH_CONFIDENCE_GESTURE", family="hand_sign"),
@@ -91,7 +91,7 @@ PROFILES: dict[str, Profile] = {
 }
 DEFAULT = Profile(NO_REACTION, "IDLE")
 
-SOCIAL_BUDGET_S = 25.0         # at most one spoken remark this often, any kind
+SOCIAL_BUDGET_S = 60.0         # at most one spoken remark this often, any kind
 CONVERSATION_WINDOW_S = 20.0   # a turn this recent means "we are talking"
 NOVELTY_WINDOW_S = 600.0
 
@@ -155,6 +155,8 @@ class ResponsePolicy:
         confidence = float(event.get("confidence", 1.0) or 0.0)
         if confidence < p.min_confidence:
             cap(MICRO, f"low_confidence({confidence:.2f})")
+        if kind == "arrived" and float(event.get("away", 1e6) or 0.0) < 600.0:
+            cap(ANIMATION_ONLY, "short_absence")       # back from a few minutes away: a wave, no words
         if kind == "shake_ended":
             duration = float(event.get("duration", 0.0) or 0.0)
             if duration < 1.2:

@@ -361,7 +361,7 @@ func _handle_event(event: Dictionary) -> void:
 			_set_external_voice(bool(event.get("active", false)))
 		"tool_result":
 			tool_result.emit(str(event.get("name", "")), event.get("result"))
-		"vision", "vision_event", "vision_status":
+		"vision", "vision_event", "vision_status", "vision_preview":
 			vision_update.emit(event)
 		"error":
 			status_changed.emit("error", str(event.get("message", "Voice relay error")))
@@ -889,3 +889,8 @@ func recover(reason: String) -> void:
 
 func set_vision_enabled(enabled: bool) -> void:
 	_send({"type": "vision_toggle", "enabled": enabled})
+
+
+## "What Miko sees" live view (local camera picture with what was measured).
+func set_vision_preview(enabled: bool) -> void:
+	_send({"type": "vision_preview", "enabled": enabled})

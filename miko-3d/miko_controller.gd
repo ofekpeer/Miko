@@ -81,6 +81,10 @@ var realtime_caption_bubbles: Dictionary = {}  # caption key -> Label
 var realtime_status_pill: PanelContainer
 var realtime_status_dot: Panel
 var miko_ui_font: Font
+var vision_preview_panel: PanelContainer
+var vision_preview_rect: TextureRect
+var vision_preview_on := false
+var vision_preview_button: Button
 const UI_BLUE := Color(0.04, 0.52, 1.0)        # iOS system blue
 const UI_GREY_BUBBLE := Color(0.23, 0.23, 0.25, 0.96)
 const UI_CARD := Color(0.07, 0.07, 0.08, 0.80)
@@ -232,8 +236,8 @@ func _ready() -> void:
 	if not miko_preview_mode:
 		get_window().min_size = Vector2i(360, 420)
 		# Visible version, so it is obvious which build is actually running.
-		get_window().title = "Miko 17.8"
-		print("MIKO VERSION: 17.8")
+		get_window().title = "Miko 17.9"
+		print("MIKO VERSION: 17.9")
 	if animation_player == null:
 		push_error("Miko AnimationPlayer was not found at MikoScene/AnimationPlayer.")
 		return
@@ -1682,6 +1686,9 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 	if event is InputEventKey and event.keycode == KEY_F7 and event.pressed and not event.echo:
 		_toggle_vision()
+		get_viewport().set_input_as_handled()
+	if event is InputEventKey and event.keycode == KEY_F6 and event.pressed and not event.echo:
+		_toggle_vision_preview()
 		get_viewport().set_input_as_handled()
 
 
@@ -5145,6 +5152,17 @@ func _setup_voice_controls() -> void:
 	realtime_camera_button.pressed.connect(_toggle_vision)
 	row.add_child(realtime_camera_button)
 	_refresh_camera_button()
+	vision_preview_button = Button.new()
+	vision_preview_button.text = "מה הוא רואה"
+	vision_preview_button.tooltip_text = "F6: מה מיקו רואה ולמה (נשאר במחשב הזה)"
+	vision_preview_button.focus_mode = Control.FOCUS_NONE
+	vision_preview_button.custom_minimum_size = Vector2(70, 40)
+	vision_preview_button.add_theme_font_size_override("font_size", 14)
+	vision_preview_button.disabled = miko_preview_mode
+	_style_voice_button(vision_preview_button, Color(0.23, 0.23, 0.25, 1.0))
+	vision_preview_button.pressed.connect(_toggle_vision_preview)
+	row.add_child(vision_preview_button)
+	_setup_vision_preview(layer)
 	# Status capsule: a coloured dot and a short state ("מקשיב", "חושב"...).
 	var pill := PanelContainer.new()
 	realtime_status_pill = pill
@@ -5211,6 +5229,57 @@ func _setup_voice_controls() -> void:
 	get_viewport().size_changed.connect(_update_realtime_voice_layout)
 	_update_realtime_voice_layout()
 	call_deferred("_fit_realtime_transcript_width")
+
+
+func _setup_vision_preview(layer: CanvasLayer) -> void:
+	var panel := PanelContainer.new()
+	vision_preview_panel = panel
+	panel.visible = false
+	panel.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
+	panel.offset_left = -346.0
+	panel.offset_right = -14.0
+	panel.offset_top = 14.0
+	panel.offset_bottom = 14.0 + 262.0
+	var style := StyleBoxFlat.new()
+	style.bg_color = UI_CARD
+	style.set_corner_radius_all(18)
+	style.set_content_margin_all(6)
+	style.border_color = Color(1, 1, 1, 0.10)
+	style.set_border_width_all(1)
+	style.shadow_color = Color(0, 0, 0, 0.35)
+	style.shadow_size = 14
+	style.anti_aliasing = true
+	panel.add_theme_stylebox_override("panel", style)
+	layer.add_child(panel)
+	var rect := TextureRect.new()
+	vision_preview_rect = rect
+	rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	rect.custom_minimum_size = Vector2(320, 240)
+	panel.add_child(rect)
+
+
+func _toggle_vision_preview() -> void:
+	if miko_preview_mode or realtime_voice == null:
+		return
+	vision_preview_on = not vision_preview_on
+	realtime_voice.set_vision_preview(vision_preview_on)
+	if vision_preview_panel != null:
+		vision_preview_panel.visible = vision_preview_on
+	if vision_preview_button != null:
+		_style_voice_button(vision_preview_button, Color(0.19, 0.55, 0.32, 1.0) if vision_preview_on else Color(0.23, 0.23, 0.25, 1.0))
+
+
+func _show_vision_preview(event: Dictionary) -> void:
+	if not vision_preview_on or vision_preview_rect == null:
+		return
+	var data := Marshalls.base64_to_raw(str(event.get("jpeg", "")))
+	if data.is_empty():
+		return
+	var image := Image.new()
+	if image.load_jpg_from_buffer(data) != OK:
+		return
+	vision_preview_rect.texture = ImageTexture.create_from_image(image)
 
 
 func _style_voice_button(button: Button, fill: Color) -> void:
@@ -5343,6 +5412,9 @@ func _update_realtime_voice_layout() -> void:
 		realtime_voice_panel.offset_right = -14.0
 	realtime_talk_button.visible = not realtime_compact_ui
 	realtime_browser_button.visible = not realtime_compact_ui
+	if vision_preview_button != null:
+		vision_preview_button.visible = not realtime_compact_ui and not realtime_narrow_ui
+		vision_preview_button.text = "רואה" if realtime_medium_ui else "מה הוא רואה"
 	realtime_transcript_scroll.visible = not realtime_compact_ui
 	realtime_talk_button.text = "החזק" if realtime_narrow_ui else ("החזק לדבר" if realtime_medium_ui else "החזק כדי לדבר")
 	realtime_browser_button.text = "שיחה" if realtime_narrow_ui else ("שיחה חופשית" if realtime_medium_ui else "שיחה בדפדפן · F8")
@@ -5630,6 +5702,9 @@ func _on_realtime_tool(name: String, result: Variant) -> void:
 
 # Camera: perception runs locally in the host; Godot only gets derived facts.
 func _on_realtime_vision(event: Dictionary) -> void:
+	if str(event.get("type", "")) == "vision_preview":
+		_show_vision_preview(event)
+		return
 	if str(event.get("type", "")) == "vision_status":
 		vision_enabled = bool(event.get("enabled", false))
 		vision_available = bool(event.get("available", false)) and str(event.get("source", "off")) != "off"

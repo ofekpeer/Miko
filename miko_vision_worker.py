@@ -6,7 +6,7 @@ interpreter, which can make the conversation stutter or stall. This worker
 runs miko_vision.VisionService on its own and talks to the host over stdin /
 stdout with one JSON object per line (logs go to stderr):
 
-  host -> worker   {"c":"enable","v":true} | {"c":"jpeg","b":"<base64>"}
+  host -> worker   {"c":"enable","v":true} | {"c":"jpeg","b":"<base64>"} | {"c":"preview","v":true}
                    {"c":"imu","unstable":0.3,"active":2.0} | {"c":"stop"}
   worker -> host   {"t":"emit","m":{...}}     Godot-facing state/status
                    {"t":"event","m":{...}}    perception event (host decides the level)
@@ -65,6 +65,8 @@ def main() -> None:
         try:
             if kind == "enable":
                 service.set_enabled(bool(command.get("v")))
+            elif kind == "preview":
+                service.set_preview(bool(command.get("v")))
             elif kind == "jpeg":
                 service.feed_jpeg(base64.b64decode(command.get("b", "")))
             elif kind == "imu":

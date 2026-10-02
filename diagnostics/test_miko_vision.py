@@ -145,11 +145,16 @@ class VisionTests(unittest.TestCase):
         self.assertFalse(engine.camera_stable)          # waves/room changes are suspended meanwhile
 
     @unittest.skipUnless(miko_vision.miko_perception and miko_vision.miko_perception.available(), "MediaPipe not installed")
-    def test_with_a_hand_model_flow_alone_never_confirms_a_wave(self):
-        engine = miko_vision.VisionEngine()           # MediaPipe: hand landmarks are required
+    def test_with_a_hand_model_motion_alone_needs_stronger_evidence(self):
+        # MediaPipe often loses a fast, blurred hand (or runs slowly): motion
+        # evidence may still confirm a clear wave, but with a higher bar.
+        engine = miko_vision.VisionEngine()
         run(engine, [frame()] * 4)
+        brief = [frame(hand=(470 + 45 * math.sin(i * 2 * math.pi / 5.0), 150)) for i in range(5)]
+        self.assertNotIn("wave", run(engine, brief, start=1.0))         # one back-and-forth is not enough
+        self.assertEqual(engine.flow_wave.confirm_at, 0.86)
         waving = [frame(hand=(470 + 45 * math.sin(i * 2 * math.pi / 5.0), 150)) for i in range(26)]
-        self.assertNotIn("wave", run(engine, waving, start=1.0))
+        self.assertEqual(run(engine, waving, start=2.0).count("wave"), 1)
 
     def test_covering_and_uncovering_the_lens(self):
         engine = miko_vision.VisionEngine()

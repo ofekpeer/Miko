@@ -25,6 +25,11 @@ func _initialize() -> void:
 		world._on_realtime_transcript(line[1], line[2], line[0], number, sid, "item-%d-%s" % [number, line[1]])
 		await process_frame
 	world._on_realtime_status("listening", "")
+	if args.size() > 1 and FileAccess.file_exists(args[1]):
+		world.vision_preview_on = true
+		world.vision_preview_panel.visible = true
+		world._show_vision_preview({"type": "vision_preview",
+			"jpeg": Marshalls.raw_to_base64(FileAccess.get_file_as_bytes(args[1]))})
 	for i in 20:
 		await process_frame
 	var image := root.get_texture().get_image()

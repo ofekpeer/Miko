@@ -110,6 +110,7 @@ class WaveDetector:
         self.cooldown = cooldown
         self.release = release
         self.can_confirm = can_confirm
+        self.confirm_at = CONFIRM            # raised when the evidence is weaker (flow without a seen hand)
         self.samples: deque = deque(maxlen=90)       # (t, HandSample | None)
         self.faces: deque = deque(maxlen=90)
         self._last_confirm = -1e9
@@ -163,7 +164,7 @@ class WaveDetector:
             return []
 
         gates = self._failed_gates(evidence)
-        if confidence >= CONFIRM and not gates and self.can_confirm:
+        if confidence >= self.confirm_at and not gates and self.can_confirm:
             self._last_confirm = t
             self._paused = False
             self.samples.clear()
@@ -198,7 +199,9 @@ class WaveDetector:
         rhythm = 0.09 <= half_period <= 0.9 if intervals else False
         x_range = (max(xs) - min(xs)) if xs else 0.0
         y_range = (max(ys) - min(ys)) if ys else 0.0
-        horizontal = x_range >= 1.3 * y_range
+        # Flow samples already require sideways velocity each frame; the blob
+        # centroid's height jitters as its shape changes, so be lenient there.
+        horizontal = x_range >= (1.3 if self.source == "hand" else 0.9) * y_range
         known = [s for s in present if s.openness >= 0.0 or s.gesture]
         if known:
             openness = sum(1.0 if (s.openness >= 0.75 or s.gesture == "open_palm") else 0.0 for s in known) / len(known)

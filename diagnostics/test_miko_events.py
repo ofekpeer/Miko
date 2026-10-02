@@ -328,6 +328,55 @@ class CameraScenes(unittest.TestCase):
                 self.assertEqual(events.count("wave"), 1, (photo, size, events))
                 self.assertFalse([e for e in events if e.startswith("shake")], (photo, size, events))
 
+    def test_live_two_lane_loop_on_a_recorded_camera_video(self):
+        """The real webcam loop (fast motion lane + slow face/hand lane) on a
+        recorded video: arrival, a real hand wave and a blurred shake."""
+        import os
+        import tempfile
+        import time
+        import cv2
+        import numpy as np
+        data = Path(__file__).parent / "data"
+        face = cv2.resize(cv2.imread(str(data / "face_sample.jpg")), (180, 180))
+        hand = cv2.resize(cv2.imread(str(data / "gesture_victory.jpg")), (200, 200))
+
+        def scene(hx=None):
+            img = self.tv._ROOM.copy()
+            img[150:330, 120:300] = face
+            if hx is not None:
+                img[20:220, int(hx):int(hx) + 200] = hand
+            return img
+        frames = [scene()] * 30 + [scene(380 + 50 * math.sin(2 * math.pi * 2 * i / 15)) for i in range(36)]
+        frames += [scene()] * 40
+        base = scene()
+        for i in range(24):
+            dx = int(36 * math.sin(2 * math.pi * 4 * i / 15))
+            k = max(3, abs(int(36 * math.cos(2 * math.pi * 4 * i / 15))) // 2 * 2 + 1)
+            frames.append(cv2.blur(np.roll(base, dx, axis=1), (k, 3)))
+        frames += [base] * 30
+        path = os.path.join(tempfile.mkdtemp(), "camera.avi")
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 15, (640, 480))
+        for f in frames:
+            writer.write(f)
+        writer.release()
+        events, previews = [], []
+        os.environ["MIKO_CAMERA_FILE"] = path
+        service = miko_vision.VisionService(lambda m: previews.append(m) if m.get("type") == "vision_preview" else None,
+                                            lambda m: events.append(m["event"]), settings_path="/nonexistent/x.json")
+        try:
+            service.start()
+            service.set_preview(True)
+            deadline = time.monotonic() + 40
+            while time.monotonic() < deadline and "shake_ended" not in events:
+                time.sleep(0.2)
+        finally:
+            service.stop()
+            os.environ.pop("MIKO_CAMERA_FILE", None)
+        self.assertIn("arrived", events)
+        self.assertEqual(events.count("wave"), 1, events)
+        self.assertEqual(events.count("shake_started"), 1, events)
+        self.assertTrue(previews, "the live view produced no pictures")
+
     def test_A_still_camera_with_noise_gives_no_physical_events(self):
         import numpy as np
         rng = np.random.default_rng(5)
