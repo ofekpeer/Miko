@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 import json
+import math
 import os
 import threading
 import time
@@ -45,7 +46,7 @@ PRESENT_AFTER = 2              # consecutive face frames before "seen"
 ABSENT_AFTER_S = 3.5           # no face for this long -> "left"
 ARRIVE_AFTER_ABSENCE_S = 8.0   # re-greet only after a real absence
 WAVE_WINDOW_S = 2.2
-WAVE_MIN_REVERSALS = 3
+WAVE_MIN_REVERSALS = 2         # left-right-left is a wave
 WAVE_COOLDOWN_S = 4.0
 STATE_INTERVAL_S = 0.2         # vision state broadcast rate (5 Hz)
 
@@ -64,23 +65,35 @@ class _Face:
     frontal: bool
 
 
-@dataclass
-class _WaveTrack:
-    samples: deque = field(default_factory=lambda: deque(maxlen=40))   # (t, vx)
+class _Oscillation:
+    """Counts direction reversals of a signed velocity within a time window."""
 
-    def add(self, t: float, vx: float) -> None:
-        self.samples.append((t, vx))
+    def __init__(self, window: float) -> None:
+        self.window = window
+        self.samples: deque = deque(maxlen=60)   # (t, v)
+
+    def add(self, t: float, v: float) -> None:
+        self.samples.append((t, v))
 
     def reversals(self, now: float, threshold: float) -> int:
-        signs = [1 if v > 0 else -1 for t, v in self.samples if now - t <= WAVE_WINDOW_S and abs(v) >= threshold]
-        return sum(1 for a, b in zip(signs, signs[1:]) if a != b)
+        signs = []
+        for t, v in self.samples:
+            if now - t <= self.window and abs(v) >= threshold:
+                sign = 1 if v > 0 else -1
+                if not signs or signs[-1] != sign:
+                    signs.append(sign)
+        return max(0, len(signs) - 1)
 
     def clear(self) -> None:
         self.samples.clear()
 
 
 class VisionEngine:
-    """Turns frames into presence, position and gesture events (no I/O)."""
+    """Turns frames into presence, position, gesture and scene-change events.
+
+    Events: arrived, left, approached, wave, covered, uncovered, shaken,
+    light_changed, motion. Pure computation, no I/O.
+    """
 
     def __init__(self, model_path: str = YUNET_PATH) -> None:
         if not available():
@@ -108,13 +121,25 @@ class VisionEngine:
         self._last_face_at = -1e9
         self._absent_since = -1e9
         self._ever_seen = False
-        self._prev_flow_gray = None
-        self._prev_face_c: tuple[float, float] | None = None
-        self._tracks = {"left": _WaveTrack(), "right": _WaveTrack()}
-        self._last_wave = -1e9
         self._size_hist: deque = deque(maxlen=30)
         self._last_approach = -1e9
-        self.events: deque = deque(maxlen=12)  # (t, name, detail)
+        # Scene / motion state.
+        self._prev_gray = None
+        self._wave = _Oscillation(WAVE_WINDOW_S)
+        self._shake = _Oscillation(1.4)
+        self._last_wave = -1e9
+        self._last_shake = -1e9
+        self._last_motion = -1e9
+        self._last_light = -1e9
+        self._face_change_at = -1e9
+        self._hann = None
+        self._jolts: deque = deque(maxlen=20)
+        self._had_face = False
+        self.covered = False
+        self._dark_since: float | None = None
+        self._bright_since: float | None = None
+        self._light_hist: deque = deque(maxlen=40)    # (t, mean brightness)
+        self.events: deque = deque(maxlen=16)  # (t, name, detail)
 
     # ------------------------------------------------------------ detection
     def _detect(self, small) -> list[_Face]:
@@ -151,9 +176,21 @@ class VisionEngine:
         now = time.monotonic() if now is None else now
         out: list[dict[str, Any]] = []
         h, w = frame.shape[:2]
+        gray = cv2.cvtColor(cv2.resize(frame, (FLOW_WIDTH, max(1, int(round(h * FLOW_WIDTH / float(w))))),
+                                       interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        out.extend(self._scene_step(gray, now))
+        if self.covered:
+            # A hand over the lens is not the owner leaving.
+            self._last_face_at = now if self.seen else self._last_face_at
+            self._prev_gray = None
+            return out
+
         scale = PROCESS_WIDTH / float(w)
         small = cv2.resize(frame, (PROCESS_WIDTH, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
         face = self._pick(self._detect(small))
+        if (face is not None) != self._had_face:
+            self._had_face = face is not None
+            self._face_change_at = now
         if face is not None:
             self._streak += 1
             self._last_face_at = now
@@ -177,8 +214,6 @@ class VisionEngine:
                 self._absent_since = now
                 self.face = None
                 self._smooth = None
-                for track in self._tracks.values():
-                    track.clear()
                 out.append(self._event(now, "left"))
 
         if self.seen and self.face is not None:
@@ -187,65 +222,123 @@ class VisionEngine:
             if old and self.face.w > old[-1] * 1.45 and now - self._last_approach > 6.0:
                 self._last_approach = now
                 out.append(self._event(now, "approached"))
-        out.extend(self._wave_step(frame, now, face))
+        out.extend(self._motion_step(gray, now))
         return out
 
     def _event(self, now: float, name: str, **detail: Any) -> dict[str, Any]:
         self.events.append((now, name, detail))
         return {"event": name, **detail}
 
-    def _wave_step(self, frame, now: float, face: _Face | None) -> list[dict[str, Any]]:
-        h, w = frame.shape[:2]
-        fh_px = max(1, int(round(h * FLOW_WIDTH / float(w))))
-        gray = cv2.cvtColor(cv2.resize(frame, (FLOW_WIDTH, fh_px), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-        prev, self._prev_flow_gray = self._prev_flow_gray, gray
-        prev_c = self._prev_face_c
-        self._prev_face_c = (face.cx, face.cy) if face is not None else None
-        if prev is None or prev.shape != gray.shape or face is None or not self.seen:
+    # ------------------------------------------------------------ scene
+    def _scene_step(self, gray, now: float) -> list[dict[str, Any]]:
+        """Lens covered / uncovered and sudden lighting changes."""
+        out = []
+        mean = float(gray.mean())
+        spread = float(gray.std())
+        dark = mean < 28 or (spread < 7 and mean < 60)
+        if dark:
+            self._bright_since = None
+            self._dark_since = self._dark_since if self._dark_since is not None else now
+            if not self.covered and now - self._dark_since >= 0.5:
+                self.covered = True
+                self._wave.clear()
+                self._shake.clear()
+                out.append(self._event(now, "covered"))
+        else:
+            self._dark_since = None
+            if self.covered:
+                self._bright_since = self._bright_since if self._bright_since is not None else now
+                if now - self._bright_since >= 0.3:
+                    self.covered = False
+                    self._light_hist.clear()
+                    out.append(self._event(now, "uncovered"))
+            else:
+                self._light_hist.append((now, mean))
+                older = [m for t, m in self._light_hist if 0.8 <= now - t <= 2.0]
+                if older and now - self._last_light > 8.0:
+                    before = sum(older) / len(older)
+                    if abs(mean - before) > max(30.0, 0.35 * before):
+                        self._last_light = now
+                        self._light_hist.clear()
+                        out.append(self._event(now, "light_changed", brighter=mean > before))
+        return out
+
+    # ------------------------------------------------------------ motion
+    def _motion_step(self, gray, now: float) -> list[dict[str, Any]]:
+        """Camera shake (whole image moves), waves and other movement."""
+        prev, self._prev_gray = self._prev_gray, gray
+        if prev is None or prev.shape != gray.shape:
             return []
-        # Ignore whole-body or camera motion: the face must be fairly still.
-        if prev_c is not None and abs(face.cx - prev_c[0]) + abs(face.cy - prev_c[1]) > 0.06:
-            for track in self._tracks.values():
-                track.clear()
-            return []
-        flow = cv2.calcOpticalFlowFarneback(prev, gray, None, 0.5, 2, 9, 2, 5, 1.1, 0)
         H, W = gray.shape
-        fx, fy, fw, fhh = face.cx * W, face.cy * H, face.w * W, face.h * H
-        top = int(max(0, fy - 2.2 * fhh))
-        bottom = int(min(H, fy + 0.9 * fhh))
-        regions = {
-            "left": (int(max(0, fx - 4.0 * fw)), int(max(0, fx - 0.8 * fw))),
-            "right": (int(min(W, fx + 0.8 * fw)), int(min(W, fx + 4.0 * fw))),
-        }
-        threshold = max(0.6, 0.12 * fw)            # px/frame, scales with distance
-        events = []
-        for side, (x0, x1) in regions.items():
-            if x1 - x0 < 4 or bottom - top < 4:
-                continue
-            patch = flow[top:bottom, x0:x1]
-            mag = np.hypot(patch[..., 0], patch[..., 1])
-            moving = mag > threshold
-            if moving.mean() < 0.02:
-                self._tracks[side].add(now, 0.0)
-                continue
-            vx = float(np.median(patch[..., 0][moving]))
-            vy = float(np.median(np.abs(patch[..., 1][moving])))
-            self._tracks[side].add(now, vx if abs(vx) > 1.1 * vy else 0.0)
-            if (self._tracks[side].reversals(now, threshold) >= WAVE_MIN_REVERSALS
-                    and now - self._last_wave >= WAVE_COOLDOWN_S):
-                self._last_wave = now
-                for track in self._tracks.values():
-                    track.clear()
-                # Image left is the owner's right hand side (camera faces them).
-                events.append(self._event(now, "wave", hand="right" if side == "left" else "left"))
-        return events
+        out = []
+        # Global motion (computer/camera moved): phase correlation measures
+        # how far the whole image shifted, even for large, fast jumps; a big
+        # share of changed pixels catches blurry shakes it cannot lock onto.
+        if self._hann is None or self._hann.shape != gray.shape:
+            self._hann = cv2.createHanningWindow((W, H), cv2.CV_32F)
+        (sx, sy), response = cv2.phaseCorrelate(prev.astype(np.float32), gray.astype(np.float32), self._hann)
+        changed = float(np.mean(cv2.absdiff(prev, gray) > 22))
+        shift = math.hypot(sx, sy)
+        global_move = (response > 0.08 and shift > 1.2) or changed > 0.55
+        if global_move:
+            axis = sx if abs(sx) >= abs(sy) else sy
+            self._shake.add(now, axis if shift > 1.2 else 0.0)
+            self._jolts.append(now)
+            jolts = sum(1 for t in self._jolts if now - t <= 1.2)
+            if (self._shake.reversals(now, 1.2) >= 2 or jolts >= 5) and now - self._last_shake > 4.0:
+                self._last_shake = now
+                self._shake.clear()
+                self._jolts.clear()
+                self._wave.clear()
+                out.append(self._event(now, "shaken"))
+            return out                          # local motion is meaningless now
+        self._shake.add(now, 0.0)
+        flow = cv2.calcOpticalFlowFarneback(prev, gray, None, 0.5, 2, 11, 2, 5, 1.1, 0)
+        gx = float(np.median(flow[..., 0]))
+        gy = float(np.median(flow[..., 1]))
+
+        # Local motion relative to the background.
+        local_x = flow[..., 0] - gx
+        local_y = flow[..., 1] - gy
+        local = np.hypot(local_x, local_y)
+        moving = local > 1.2
+        if self.face is not None and self.seen:
+            # Head movement is not a gesture: ignore the face box.
+            f = self.face
+            x0, x1 = int((f.cx - 0.7 * f.w) * W), int((f.cx + 0.7 * f.w) * W)
+            y0, y1 = int((f.cy - 0.8 * f.h) * H), int((f.cy + 0.9 * f.h) * H)
+            moving[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = False
+        area = float(moving.mean())
+        if area < 0.006:
+            self._wave.add(now, 0.0)
+            return out
+        vx = float(np.median(local_x[moving]))
+        vy = float(np.median(np.abs(local_y[moving])))
+        ys, xs = np.nonzero(moving)
+        cx = float(xs.mean()) / W
+        # A hand: a modest area moving mostly sideways, back and forth.
+        if 0.006 <= area <= 0.35 and abs(vx) > 0.9 * vy:
+            self._wave.add(now, vx)
+        else:
+            self._wave.add(now, 0.0)
+        if self._wave.reversals(now, 1.0) >= WAVE_MIN_REVERSALS and now - self._last_wave >= WAVE_COOLDOWN_S:
+            self._last_wave = now
+            self._wave.clear()
+            # Image left is the owner's right (the camera faces them).
+            out.append(self._event(now, "wave", hand="right" if cx < 0.5 else "left"))
+        elif (area > 0.12 and now - self._last_motion > 6.0 and now - self._last_wave > 2.0
+              and now - self._face_change_at > 1.5):
+            # Something big moved (someone walked by, the owner stood up).
+            self._last_motion = now
+            out.append(self._event(now, "motion", x=round(-(cx * 2 - 1), 2)))
+        return out
 
     # ------------------------------------------------------------ outputs
     def state(self) -> dict[str, Any]:
         """Godot-facing state. x/y are from the viewer's side: +x = owner's
         right (screen right), +y = up; size ~ face width / frame width."""
         if not self.seen or self.face is None:
-            return {"type": "vision", "seen": False}
+            return {"type": "vision", "seen": False, "covered": self.covered}
         f = self.face
         return {"type": "vision", "seen": True, "x": round(-(f.cx * 2 - 1), 3), "y": round(-(f.cy * 2 - 1), 3),
                 "size": round(f.w, 3), "facing": bool(f.frontal)}
@@ -254,6 +347,8 @@ class VisionEngine:
         """Model-facing facts (miko_get_vision). No image content."""
         now = time.monotonic() if now is None else now
         recent = [{"event": n, "seconds_ago": round(now - t, 1), **d} for t, n, d in self.events if now - t <= 120]
+        if self.covered:
+            return {"status": "camera_covered", "seen": False, "recent_events": recent}
         if not self.seen or self.face is None:
             return {"status": "watching", "seen": False, "recent_events": recent}
         f = self.face
@@ -421,7 +516,7 @@ class VisionService:
                 now = time.monotonic()
                 if now < next_at:
                     continue
-                next_at = now + 0.09                    # ~11 fps analysis
+                next_at = now + 0.06                    # ~15 fps analysis (waves are fast)
                 self.feed_frame(frame, now)
         finally:
             capture.release()
@@ -454,7 +549,8 @@ class VisionService:
         for event in events:
             message = {"type": "vision_event", **event}
             self.emit(message)
-            if self.react and event["event"] in ("wave", "arrived"):
+            print("MIKO VISION EVENT:", event["event"])
+            if self.react and event["event"] in ("wave", "arrived", "covered", "uncovered", "shaken"):
                 try:
                     self.react(message)
                 except Exception as error:  # never let a reaction kill the camera loop

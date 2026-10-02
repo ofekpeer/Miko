@@ -600,28 +600,48 @@ class RealtimeHub:
         if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._vision_greeting(event), self.loop)
 
+    VISION_NOTES = {
+        'wave':'[ראייה] הבעלים מנופף לך לשלום עכשיו מול המצלמה. החזר שלום קצר וחם במילים שלך (למשל "היי!"), בלי שאלה ארוכה.',
+        'arrived':'[ראייה] הבעלים חזר עכשיו והוא מול המצלמה. ברך אותו בקצרה וטבעי, בלי תפריט אפשרויות.',
+        'covered':'[ראייה] מישהו כיסה עכשיו את המצלמה ואתה לא רואה כלום. תגיב בקצרה ובהומור, כמו "היי, איפה כולם? אני לא רואה!"',
+        'uncovered':'[ראייה] המצלמה נחשפה שוב ואתה רואה. תגיב בשמחה וקצר, כמו "הנה אתה! קוקו!"',
+        'shaken':'[ראייה] המחשב או המצלמה רעדו בחוזקה עכשיו, כאילו מישהו טלטל אותך. תגיב בקצרה ובהומור, כמו "וואו! מה זה היה? הסתחרר לי".',
+    }
+    # Seconds between spoken reactions of the same kind.
+    VISION_COOLDOWN = {'wave':30, 'arrived':60, 'covered':20, 'uncovered':20, 'shaken':25}
+
     async def _vision_greeting(self, event):
+        kind = event.get('event')
+        note = self.VISION_NOTES.get(kind)
         now = time.time()
-        if self.browser_id or now - self.vision_spoken_at < 45:
+        if not note or self.browser_id:
             return
-        with self.brain.state_lock:
-            history = self.brain.miko.get('realtime_conversation_history', [])
-            last_talk = history[-1].get('at', 0) if history and isinstance(history[-1], dict) else 0
-        if now - float(last_talk or 0) < 8:
-            return                          # mid-conversation: the gesture is enough
-        note = {
-            'wave':'[ראייה] הבעלים מנופף לך לשלום עכשיו מול המצלמה. החזר שלום קצר וחם במילים שלך (למשל "היי!"), בלי שאלה ארוכה.',
-            'arrived':'[ראייה] הבעלים חזר עכשיו והוא מול המצלמה. ברך אותו בקצרה וטבעי, בלי תפריט אפשרויות.',
-        }.get(event.get('event'))
-        if not note:
+        spoken = getattr(self, 'vision_event_spoken', {})
+        self.vision_event_spoken = spoken
+        if now - self.vision_spoken_at < 4 or now - spoken.get(kind, 0) < self.VISION_COOLDOWN.get(kind, 30):
             return
+        if kind in ('arrived', 'wave'):
+            with self.brain.state_lock:
+                history = self.brain.miko.get('realtime_conversation_history', [])
+                last_talk = history[-1].get('at', 0) if history and isinstance(history[-1], dict) else 0
+            if now - float(last_talk or 0) < 8:
+                return                      # mid-conversation: the gesture is enough
         for native in list(self.native):
-            # Only an already-open, idle voice session speaks; sight never
-            # opens a paid model connection by itself or talks over the owner.
-            if native.api and not native.responding and native.input_bytes == 0:
-                self.vision_spoken_at = now
-                await native.request_response({'instructions':INSTRUCTIONS+'\n'+note,'tool_choice':'none'})
-                return
+            if native.responding or native.input_bytes:
+                return                      # never talk over the owner or itself
+            if not native.api:
+                # Playful reactions may open the voice session (rate limited);
+                # a plain arrival never opens a paid connection by itself.
+                if kind == 'arrived' or now - getattr(self, 'vision_opened_at', 0.0) < 60:
+                    continue
+                self.vision_opened_at = now
+                await native.ensure_session()
+                if not native.api:
+                    continue
+            self.vision_spoken_at = now
+            spoken[kind] = now
+            await native.request_response({'instructions':INSTRUCTIONS+'\n'+note,'tool_choice':'none'})
+            return
 
     async def handler(self, ws):
         remote = ws.remote_address

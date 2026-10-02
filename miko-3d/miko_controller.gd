@@ -5465,6 +5465,13 @@ func _on_realtime_vision(event: Dictionary) -> void:
 		vision_error = str(event.get("error", ""))
 		_refresh_camera_button()
 		return
+	if str(event.get("type", "")) == "vision_event" and realtime_status_label != null:
+		var noticed := {"wave": "נפנוף", "arrived": "הגעת", "left": "יצאת מהתמונה", "approached": "התקרבת",
+			"covered": "המצלמה מכוסה", "uncovered": "רואה שוב", "shaken": "טלטול", "light_changed": "שינוי תאורה",
+			"motion": "תנועה"}
+		var label := str(noticed.get(str(event.get("event", "")), ""))
+		if not label.is_empty():
+			realtime_status_label.text = "מיקו שם לב: " + label
 	var character := get_node_or_null("MikoScene")
 	if character != null and character.has_method("on_vision"):
 		character.call("on_vision", event)

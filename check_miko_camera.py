@@ -39,7 +39,7 @@ def ensure_opencv() -> bool:
         return False
 
 
-CHECK_VERSION = "17.4.3"   # loads the face model from memory (Hebrew paths OK)
+CHECK_VERSION = "17.4.4"   # waves, cover, shake, light and motion events
 
 
 def main() -> int:
@@ -63,7 +63,8 @@ def main() -> int:
         return 1
     print("OK ", description)
     engine = miko_vision.VisionEngine()
-    print("\nLook at the camera, then wave hello beside your face. Press Q to finish.\n")
+    print("\nTry: look at the camera, wave beside your face, cover the lens with your hand,")
+    print("shake the laptop gently, switch a light. Press Q to finish.\n")
     seen_once = waved = False
     frames = 0
     gui = True               # opencv-python-headless has no preview window
@@ -77,7 +78,10 @@ def main() -> int:
             for event in engine.process(frame):
                 name = event["event"]
                 print({"arrived": "**  I see you!", "left": "..  you left the frame",
-                       "wave": "**  you waved - Miko waves back", "approached": "**  you came closer"}.get(name, name))
+                       "wave": "**  you waved - Miko waves back", "approached": "**  you came closer",
+                       "covered": "**  camera covered - Miko can't see", "uncovered": "**  peekaboo - Miko sees again",
+                       "shaken": "**  the camera shook - Miko wobbles", "light_changed": "**  the light changed",
+                       "motion": "**  something moved"}.get(name, name))
                 seen_once |= name == "arrived"
                 waved |= name == "wave"
             now = time.monotonic()

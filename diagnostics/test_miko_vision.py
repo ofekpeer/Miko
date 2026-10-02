@@ -29,8 +29,14 @@ HAND = (RNG.integers(60, 200, (70, 50, 3))).astype(np.uint8)
 HAND = cv2.GaussianBlur(HAND, (5, 5), 0)
 
 
+# A room-like textured background: real scenes have texture, which is what
+# lets the engine tell a moving camera from a moving hand.
+_ROOM = cv2.GaussianBlur(RNG.integers(40, 170, (480, 640, 3)).astype(np.uint8), (0, 0), 1.5)
+_ROOM = cv2.addWeighted(_ROOM, 0.6, np.full_like(_ROOM, (92, 104, 112)), 0.4, 0)
+
+
 def frame(face_x=240, hand=None):
-    img = np.full((480, 640, 3), (92, 104, 112), np.uint8)
+    img = _ROOM.copy()
     face = cv2.resize(FACE, (200, 200))
     img[120:320, face_x:face_x + 200] = face
     if hand is not None:
@@ -78,9 +84,52 @@ class VisionTests(unittest.TestCase):
         sway = [frame(face_x=int(240 + 60 * math.sin(i * 2 * math.pi / 5.0))) for i in range(26)]
         self.assertNotIn("wave", run(engine, sway, start=1.0))
 
+    def test_wave_detected_even_while_the_head_moves(self):
+        engine = miko_vision.VisionEngine()
+        run(engine, [frame()] * 4)
+        waving = [frame(face_x=int(240 + 6 * math.sin(i)), hand=(470 + 45 * math.sin(i * 2 * math.pi / 5.0), 150))
+                  for i in range(26)]
+        self.assertIn("wave", run(engine, waving, start=1.0))
+
+    def test_shaking_the_camera_is_noticed_and_is_not_a_wave(self):
+        engine = miko_vision.VisionEngine()
+        run(engine, [frame()] * 4)
+        base = frame()
+        shaken = []
+        for i in range(20):
+            dx = int(14 * math.sin(i * 2 * math.pi / 4.0))
+            dy = int(6 * math.cos(i * 2 * math.pi / 4.0))
+            shaken.append(np.roll(np.roll(base, dx, axis=1), dy, axis=0))
+        events = run(engine, shaken, start=1.0)
+        self.assertIn("shaken", events)
+        self.assertNotIn("wave", events)
+
+    def test_covering_and_uncovering_the_lens(self):
+        engine = miko_vision.VisionEngine()
+        dark = np.full((480, 640, 3), 8, np.uint8)
+        events = run(engine, [frame()] * 4 + [dark] * 12 + [frame()] * 6)
+        self.assertEqual(events, ["arrived", "covered", "uncovered"])
+        self.assertTrue(engine.seen)                 # covering is not leaving
+
+    def test_lights_turning_off_is_a_light_change(self):
+        engine = miko_vision.VisionEngine()
+        dim = (frame().astype(np.float32) * 0.45).astype(np.uint8)
+        events = run(engine, [frame()] * 25 + [dim] * 15)
+        self.assertIn("light_changed", events)
+        self.assertNotIn("covered", events)
+
+    def test_sitting_still_with_sensor_noise_triggers_nothing(self):
+        engine = miko_vision.VisionEngine()
+        noisy = []
+        for i in range(80):
+            f = frame(face_x=240 + (i % 3) - 1).astype(np.int16)
+            f += RNG.normal(0, 5, f.shape).astype(np.int16)
+            noisy.append(np.clip(f, 0, 255).astype(np.uint8))
+        self.assertEqual(run(engine, noisy), ["arrived"])
+
     def test_leaving_and_returning(self):
         engine = miko_vision.VisionEngine()
-        empty = np.full((480, 640, 3), (92, 104, 112), np.uint8)
+        empty = _ROOM.copy()
         events = run(engine, [frame()] * 4 + [empty] * 150 + [frame()] * 4)
         self.assertEqual(events, ["arrived", "left", "arrived"])
         self.assertFalse(miko_vision.VisionEngine().state()["seen"])
@@ -118,6 +167,9 @@ class GreetingTests(unittest.TestCase):
             async def request_response(self, response=None):
                 self.calls.append(response)
 
+            async def ensure_session(self):
+                self.api = object()
+
         hub = miko_realtime.RealtimeHub.__new__(miko_realtime.RealtimeHub)
         hub.browser_id, hub.vision_spoken_at, hub.brain = None, 0.0, Brain()
         native = Native()
@@ -144,6 +196,25 @@ class GreetingTests(unittest.TestCase):
         hub2, native2 = self._hub(history_at=time.time())
         asyncio.run(hub2._vision_greeting({"event": "wave"}))
         self.assertEqual(native.calls + native2.calls, [])
+
+
+class PlayfulReactionTests(GreetingTests):
+    def test_covering_and_shaking_get_spoken_reactions(self):
+        import asyncio
+        hub, native = self._hub()
+        asyncio.run(hub._vision_greeting({"event": "covered"}))
+        hub.vision_spoken_at = 0.0
+        asyncio.run(hub._vision_greeting({"event": "shaken"}))
+        self.assertEqual(len(native.calls), 2)
+        self.assertIn("כיסה", native.calls[0]["instructions"])
+        self.assertIn("רעדו", native.calls[1]["instructions"])
+
+    def test_closed_session_opens_once_for_a_wave(self):
+        import asyncio
+        hub, native = self._hub()
+        native.api = None
+        asyncio.run(hub._vision_greeting({"event": "wave"}))
+        self.assertEqual(len(native.calls), 1)          # opened, then spoke
 
 
 if __name__ == "__main__":

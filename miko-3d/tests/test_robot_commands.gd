@@ -110,6 +110,21 @@ func _initialize() -> void:
 	robot.on_vision({"type": "vision_event", "event": "arrived"})
 	if robot._asleep:
 		_fail("arrival did not wake Miko"); return
+	# Covering the camera: startled peer; uncovering: peekaboo hop.
+	robot._command = ""
+	robot.on_vision({"type": "vision_event", "event": "covered"})
+	if not robot._blind or robot._gesture != "peer":
+		_fail("covering the camera got no reaction"); return
+	await _frames(90)
+	robot.on_vision({"type": "vision_event", "event": "uncovered"})
+	if robot._blind or robot._gesture != "hop":
+		_fail("uncovering the camera got no peekaboo"); return
+	await _frames(120)
+	# Shaking the computer: wobble, then shake it off.
+	robot.on_vision({"type": "vision_event", "event": "shaken"})
+	if robot._gesture != "wobble" or robot._dizzy_left <= 0.0:
+		_fail("shaking got no wobble"); return
+	await _frames(100)
 	# Without fresh vision data it falls back to the screen camera.
 	robot.on_vision({"type": "vision", "seen": false})
 	var screen: Vector3 = robot.to_local(robot.get_viewport().get_camera_3d().global_position)

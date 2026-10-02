@@ -103,6 +103,8 @@ var _vision_fresh_until := -1.0
 var _vision_point := Vector3.ZERO      # owner's head, MikoScene local space
 var _vision_last_seen := -1e9
 var _surprise_left := 0.0
+var _blind := false                    # camera covered: Miko "can't see"
+var _dizzy_left := 0.0
 
 var _gesture := ""
 var _gesture_t := 0.0
@@ -276,6 +278,14 @@ func _on_conversation_start() -> void:
 		_queue_gesture("wave", 2.3, 0.0, true)
 
 
+func _wake_for_reaction() -> void:
+	if _asleep or _sleep_walk:
+		_asleep = false
+		_sleep_walk = false
+		if not _sit_hold:
+			_sit_goal = 0.0
+
+
 func _camera_local() -> Vector3:
 	# Where the owner actually is when the camera sees them; else the screen.
 	if _vision_seen and _clock < _vision_fresh_until:
@@ -341,6 +351,47 @@ func on_vision(event: Dictionary) -> void:
 			_surprise_left = 1.6
 			if _command == "" and _gesture == "":
 				_queue_gesture("tilt", 1.3)
+		"covered":
+			# Someone put a hand over its eyes: startled, then peers at the lens.
+			_blind = true
+			_surprise_left = 1.8
+			_wake_for_reaction()
+			_walking = false
+			_look_user = true
+			_face_yaw_goal = _yaw_toward(_camera_local())
+			_queue_gesture("peer", 2.6, 0.0, true)
+		"uncovered":
+			# Peekaboo: there you are!
+			_blind = false
+			_wake_for_reaction()
+			_look_user = true
+			_face_yaw_goal = _yaw_toward(_camera_local())
+			_queue_gesture("hop", 1.1, 0.0, true)
+			_gesture_queue.append(["laugh", 1.6])
+		"shaken":
+			# The world shook: loses balance, wobbles, shakes it off.
+			_wake_for_reaction()
+			_walking = false
+			_surprise_left = 1.2
+			_dizzy_left = 3.2
+			_queue_gesture("wobble", 2.2, 0.0, true)
+			_gesture_queue.append(["shake_head", 1.1])
+		"light_changed":
+			if _command == "":
+				_surprise_left = 1.0
+				_look_point = to_local(global_position) + Vector3(_rng.randf_range(-1.0, 1.0), 2.2, -1.5)
+				_look_user = false
+				_look_wait = 2.5
+				_queue_gesture("glance", 2.0)
+		"motion":
+			if _command == "" and not _asleep and _gesture == "":
+				# Something moved over there: look that way for a moment.
+				var side := clampf(float(event.get("x", 0.0)), -1.0, 1.0)
+				var camera_point := _camera_local()
+				_look_point = camera_point + Vector3(side * 1.6, -0.2, 0.0)
+				_look_user = false
+				_look_wait = 2.2
+				_surprise_left = 0.6
 
 
 func _yaw_toward(point: Vector3) -> float:
@@ -864,6 +915,29 @@ func _gesture_pose(q: Dictionary, root: Array) -> Dictionary:
 			_add(q, "head", Quaternion(RIGHT, 0.16 * sin(t * TAU * 2.0) * e))
 		"tilt":
 			_add(q, "head", Quaternion(FORWARD, s * 0.17 * e))
+		"peer":
+			# Leans in toward the covered lens, head cocking side to side.
+			_add(q, "spine", Quaternion(RIGHT, 0.12 * e))
+			_add(q, "head", Quaternion(RIGHT, 0.10 * e) * Quaternion(FORWARD, 0.20 * sin(t * TAU * 1.5) * e))
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(RIGHT, -0.40 * e) * Quaternion(FORWARD, k * 0.15 * e))
+				_add(q, "forearm." + side_name, Quaternion(RIGHT, -0.70 * e))
+		"wobble":
+			# Off balance: decaying sway, arms out to steady itself.
+			var decay := 1.0 - _ease(t, 0.15, 1.0)
+			var sway := sin(t * TAU * 3.0) * decay * e
+			root[0] += Vector3(0.025 * sway, -0.01 * absf(sway), 0.0)
+			_add(q, "hips", Quaternion(FORWARD, 0.14 * sway))
+			_add(q, "spine", Quaternion(FORWARD, -0.20 * sway) * Quaternion(RIGHT, 0.05 * e))
+			_add(q, "head", Quaternion(FORWARD, 0.22 * sin(t * TAU * 3.0 + 0.8) * decay * e))
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["upperarm." + side_name] = e
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(FORWARD, k * (0.9 + 0.25 * sway * k) * e))
+				_add(q, "forearm." + side_name, Quaternion(FORWARD, k * 0.35 * e))
 		"shake_head":
 			_add(q, "head", Quaternion(UP, 0.32 * sin(t * TAU * 2.5) * e))
 		"hum":
@@ -1034,6 +1108,13 @@ func _update_face(delta: float, state: Dictionary) -> void:
 		goal["smile"] = 0.8
 	if state["listening"]:
 		goal["size"] = maxf(goal["size"], 1.05)
+	_dizzy_left = maxf(0.0, _dizzy_left - delta)
+	if _blind:
+		goal["open_base"] = minf(goal["open_base"], 0.55)   # squinting at the dark
+		goal["sad"] = maxf(goal["sad"], 0.3)
+	if _dizzy_left > 0.0 and _surprise_left <= 0.0:
+		goal["size"] = 0.85
+		goal["smile"] = -0.1
 	_surprise_left = maxf(0.0, _surprise_left - delta)
 	if _surprise_left > 0.0:
 		goal["surprise"] = maxf(goal["surprise"], 0.7)
@@ -1058,6 +1139,10 @@ func _update_face(delta: float, state: Dictionary) -> void:
 	var gaze := Vector2(clampf(_head.x * 0.9, -1.0, 1.0), clampf(_head.y * 1.4, -1.0, 1.0)) + _saccade
 	if _gesture == "think" or state["thinking"]:
 		gaze = Vector2(0.55 * _gesture_side, 0.75)
+	if _dizzy_left > 0.0:
+		# Seeing stars: eyes roll in small circles after a shake.
+		var spin := _dizzy_left * 7.0
+		gaze = Vector2(cos(spin), sin(spin)) * 0.55 * clampf(_dizzy_left, 0.0, 1.0)
 	# Mouth: only speech opens it (one drawn shape, nothing painted beneath).
 	var mouth_open := 0.0
 	var mouth_round := 0.0
