@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
+import ctypes
 import subprocess
 import sys
 import time
@@ -94,9 +96,26 @@ for name in protected:
     if file.is_file():
         digests[name]=hashlib.sha256(file.read_bytes()).hexdigest()
         if (backup/name).read_bytes()!=file.read_bytes():shutil.copy2(file,backup/(file.stem+'_at_stop'+file.suffix))
-for name in sources:shutil.copy2(source/name,target/name)
+def _replace_file(src,dst):
+    # Windows refuses to overwrite a read-only or hidden file (OneDrive and
+    # earlier tools can leave dotfiles hidden). Clear those attributes and
+    # retry briefly in case OneDrive is syncing the file.
+    for attempt in range(6):
+        try:
+            return shutil.copy2(src,dst)
+        except PermissionError:
+            if not os.path.exists(dst) or attempt==5:raise
+            try:
+                os.chmod(dst,stat.S_IWRITE|stat.S_IREAD)
+                if os.name=='nt':ctypes.windll.kernel32.SetFileAttributesW(str(dst),0x80)  # FILE_ATTRIBUTE_NORMAL
+            except OSError:
+                pass
+            time.sleep(0.5)
+
+for name in sources:_replace_file(source/name,target/name)
 for folder in ['miko-3d','device','vision_models']:
-    shutil.copytree(source/folder,target/folder,dirs_exist_ok=True,ignore=shutil.ignore_patterns('.godot','.git','__pycache__','*.log'))
+    shutil.copytree(source/folder,target/folder,dirs_exist_ok=True,copy_function=_replace_file,
+                    ignore=shutil.ignore_patterns('.godot','.git','__pycache__','*.log','.editorconfig','.gitattributes','.gitignore'))
 config=json.loads((source/'miko_launch.json').read_text(encoding='utf-8'))
 config['runtime_dir']=str(target)
 (target/'miko_launch.json').write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
