@@ -1,0 +1,42 @@
+{
+  "blink_variants": [
+    "idle_blink",
+    "listening_blink",
+    "speaking_blink"
+  ],
+  "display_note": "ESP display shows these pre-rendered frames; 3D rendering remains on the desktop host.",
+  "files": [
+    "idle.png",
+    "idle_blink.png",
+    "listening.png",
+    "listening_blink.png",
+    "speaking.png",
+    "speaking_blink.png",
+    "happy.png",
+    "sleep.png"
+  ],
+  "format": "PNG RGB8",
+  "height": 280,
+  "states": [
+    "idle",
+    "listening",
+    "speaking",
+    "happy",
+    "sleep"
+  ],
+  "suggested_caption_safe_rect": [
+    8,
+    242,
+    224,
+    30
+  ],
+  "suggested_status_map": {
+    "idle": "idle.png",
+    "listening": "listening.png",
+    "ready": "idle.png",
+    "sleep": "sleep.png",
+    "speaking": "speaking.png",
+    "thinking": "listening.png"
+  },
+  "width": 240
+}

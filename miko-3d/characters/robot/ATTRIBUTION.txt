@@ -1,0 +1,8 @@
+Model: "Cartoon Robot" by alexandermadrews
+Source: https://sketchfab.com/3d-models/cartoon-robot-43e3e1a1d00a4f0ba5fdfff7aef26230
+License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+
+Changes for Miko: normalized and decimated, painted eyes removed from the
+visor texture, visor split into a live-drawn face screen, hidden glass shell
+removed, humanoid skeleton and skin weights added, materials retuned.
+Build script: character_pipeline/blender/robot_build.py

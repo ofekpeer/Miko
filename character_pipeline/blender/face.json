@@ -1,0 +1,36 @@
+{
+  "A": 833.21,
+  "BX": 539.9,
+  "BZ": 105.5,
+  "image_height": 1024,
+  "eye_left_px": [
+    415.1,
+    372.5
+  ],
+  "eye_right_px": [
+    611.3,
+    373.6
+  ],
+  "eye_radius": 0.034,
+  "eye_embed": 0.45,
+  "lid_open_deg": 96,
+  "lid_low_open_deg": 62,
+  "lid_up_color": [
+    0.78,
+    0.42,
+    0.16
+  ],
+  "lid_low_color": [
+    0.86,
+    0.74,
+    0.6
+  ],
+  "mouth_px": [
+    513.0,
+    428.0
+  ],
+  "mouth_width": 0.075,
+  "mouth_height": 0.05,
+  "lid_up_edge": -0.32,
+  "lid_low_edge": -0.3
+}

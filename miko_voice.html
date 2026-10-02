@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>מיקו — שיחה קולית</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #091121;
+      color: #f3f7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 50% 18%, rgba(69, 171, 203, .23), transparent 35%),
+        radial-gradient(circle at 10% 90%, rgba(143, 98, 210, .16), transparent 35%),
+        #091121;
+    }
+    main { width: min(760px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 42px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: clamp(28px, 5vw, 38px); font-weight: 750; letter-spacing: -.03em; }
+    .sub { color: #aabbd0; font-size: 14px; margin-top: 4px; }
+    .badge { color: #b7e9f0; border: 1px solid #3b8090; border-radius: 999px; padding: 8px 12px; font-size: 12px; white-space: nowrap; }
+    .hero { text-align: center; padding: 34px 8px 20px; }
+    .orb {
+      width: 180px; height: 180px; margin: 0 auto 24px; border-radius: 50%;
+      display: grid; place-items: center; font-size: 58px;
+      background: radial-gradient(circle at 35% 30%, #b8fcff, #4aa5c8 45%, #3351a4 82%);
+      box-shadow: 0 0 45px rgba(57, 174, 219, .32), inset -15px -20px 28px rgba(7, 25, 74, .34);
+      transition: transform .25s, box-shadow .25s;
+    }
+    .listening .orb { animation: breathe 2s ease-in-out infinite; box-shadow: 0 0 60px rgba(75, 217, 194, .68), inset -15px -20px 28px rgba(7, 25, 74, .34); }
+    .speaking .orb { animation: speak .7s ease-in-out infinite alternate; box-shadow: 0 0 65px rgba(122, 163, 255, .7), inset -15px -20px 28px rgba(7, 25, 74, .34); }
+    @keyframes breathe { 50% { transform: scale(1.06); } }
+    @keyframes speak { to { transform: scale(1.09) rotate(2deg); } }
+    #status { font-size: 20px; font-weight: 650; min-height: 28px; }
+    #detail { color: #aabbd0; margin: 8px 0 0; min-height: 22px; font-size: 14px; }
+    .controls { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 18px 0 24px; }
+    button {
+      border: 1px solid #45627b; background: #192c45; color: #f3f7ff; border-radius: 14px;
+      min-height: 46px; padding: 10px 18px; font: inherit; font-weight: 650; cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #254563; }
+    button:disabled { opacity: .48; cursor: not-allowed; }
+    .primary { border-color: #55d3d8; color: #09232c; background: #71dfe2; }
+    .primary:hover:not(:disabled) { background: #a0f4ef; }
+    .danger { border-color: #a65f70; background: #563042; }
+    .card { background: rgba(15, 31, 52, .87); border: 1px solid #2e455f; border-radius: 20px; padding: 20px; }
+    .card h2 { margin: 0 0 12px; font-size: 18px; }
+    #transcript { height: min(38vh, 360px); overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+    .turn { display: flex; flex-direction: column; gap: 10px; }
+    .line { width: fit-content; max-width: 87%; border-radius: 16px; padding: 10px 14px; line-height: 1.5; overflow-wrap: anywhere; }
+    .line.owner { align-self: flex-start; background: #215064; }
+    .line.miko { align-self: flex-end; background: #303a66; }
+    .line.system { align-self: center; color: #aabbd0; font-size: 13px; background: transparent; }
+    .line .who { display: block; font-size: 11px; opacity: .72; margin-bottom: 3px; }
+    .line.partial { opacity: .7; }
+    form { display: flex; gap: 8px; margin-top: 14px; }
+    input { flex: 1; min-width: 0; border: 1px solid #426079; border-radius: 12px; background: #0c1c30; color: #f3f7ff; padding: 12px; font: inherit; }
+    input:focus-visible, button:focus-visible { outline: 2px solid #79e4e8; outline-offset: 2px; }
+    #audioControls { display: none; width: 100%; margin-top: 12px; }
+    #audioControls.visible { display: block; }
+    footer { text-align: center; color: #92a5bc; font-size: 12px; margin-top: 18px; }
+    @media (max-width: 520px) { .orb { width: 145px; height: 145px; } .controls button { flex: 1 1 42%; } }
+  </style>
+</head>
+<body>
+<main id="app">
+  <header>
+    <div><h1>מיקו</h1><div class="sub">שיחה קולית טבעית</div></div>
+    <div id="modelBadge" class="badge">קול: cedar</div>
+  </header>
+  <section class="hero" aria-label="מצב השיחה">
+    <div class="orb" aria-hidden="true">✦</div>
+    <div id="status" role="status" aria-live="polite">מוכן לשיחה</div>
+    <p id="detail">לחץ על ״התחל שיחה״ ואשר גישה למיקרופון.</p>
+  </section>
+  <div class="controls">
+    <button id="startButton" class="primary" type="button">התחל שיחה</button>
+    <button id="muteButton" type="button" disabled>השתק מיקרופון</button>
+    <button id="interruptButton" type="button" disabled>עצור את מיקו</button>
+    <button id="stopButton" class="danger" type="button" disabled>סיים שיחה</button>
+  </div>
+  <section class="card">
+    <h2>השיחה</h2>
+    <div id="transcript" role="log" aria-live="polite" aria-relevant="additions text"></div>
+    <form id="textForm">
+      <input id="textInput" type="text" placeholder="אפשר גם לכתוב למיקו…" autocomplete="off" disabled aria-label="הודעה למיקו">
+      <button id="textSend" type="submit" disabled>שלח</button>
+    </form>
+    <audio id="audioControls" controls autoplay playsinline aria-label="השמע את קולו של מיקו"></audio>
+  </section>
+  <footer>הקול של מיקו מסונתז. המיקרופון פועל רק בזמן שיחה פעילה.</footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const app = $("app");
+  const statusEl = $("status");
+  const detailEl = $("detail");
+  const transcriptEl = $("transcript");
+  const startButton = $("startButton");
+  const muteButton = $("muteButton");
+  const interruptButton = $("interruptButton");
+  const stopButton = $("stopButton");
+  const textForm = $("textForm");
+  const textInput = $("textInput");
+  const textSend = $("textSend");
+  const audioEl = $("audioControls");
+
+  let pc = null;
+  let dc = null;
+  let microphone = null;
+  let sessionId = "";
+  let realtimeSessionId = "";
+  let ready = false;
+  let starting = false;
+  let closing = false;
+  let muted = false;
+  let runId = 0;
+  let interruptionEpoch = 0;
+  let activeResponseId = "";
+  let latestUserItemId = "";
+  let latestAssistantItemId = "";
+  let latestPlaybackResponseId = "";
+  let playbackEnabled = false;
+  let disconnectTimer = null;
+  let heartbeatTimer = null;
+  let audioContext = null;
+  let audioSource = null;
+  let audioAnalyser = null;
+  let levelTimer = null;
+  let levelReportPending = false;
+  const responseEpochs = new Map();
+  const responseStatuses = new Map();
+  const responseTurns = new Map();
+  const automaticResponseTurns = [];
+  const inputEpochs = new Map();
+  const responseItemIds = new Map();
+  const playbackEpochs = new Map();
+  const interruptedResponseIds = new Set();
+  const turnReports = new Map();
+  const userLines = new Map();
+  const assistantLines = new Map();
+  const turnContainers = new Map();
+  const itemTurns = new Map();
+  const transcriptReports = new Map();
+  const transcriptWaiters = new Map();
+  const pendingTextResponses = new Map();
+  const reportedEvents = new Set();
+  const processedCallIds = new Set();
+  let criticalEventTail = Promise.resolve(true);
+
+  function setStatus(message, detail) {
+    statusEl.textContent = message;
+    if (detail !== undefined) detailEl.textContent = detail;
+  }
+
+  function refreshControls() {
+    startButton.disabled = starting || ready;
+    muteButton.disabled = !ready;
+    interruptButton.disabled = !ready;
+    stopButton.disabled = !ready && !starting;
+    textInput.disabled = !ready || pendingTextResponses.size > 0;
+    textSend.disabled = !ready || pendingTextResponses.size > 0;
+    muteButton.textContent = muted ? "הפעל מיקרופון" : "השתק מיקרופון";
+    app.classList.toggle("listening", ready && !muted && !app.classList.contains("speaking"));
+  }
+
+  function turnContainer(turnId) {
+    let container = turnContainers.get(turnId);
+    if (!container) {
+      container = document.createElement("div");
+      container.className = "turn";
+      container.dataset.turnId = turnId;
+      turnContainers.set(turnId, container);
+      transcriptEl.append(container);
+    }
+    return container;
+  }
+
+  function line(role, key, text, partial, originatingTurn = "") {
+    const map = role === "owner" ? userLines : assistantLines;
+    const turnId = originatingTurn || itemTurns.get(key) || (role === "owner" ? key : latestUserItemId) || key;
+    itemTurns.set(key, turnId);
+    const container = turnContainer(turnId);
+    let item = map.get(key);
+    if (!item) {
+      item = document.createElement("div");
+      item.className = "line " + role;
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = role === "owner" ? "אתה" : "מיקו";
+      const body = document.createElement("span");
+      body.className = "body";
+      item.append(who, body);
+      map.set(key, item);
+      if (role === "owner") container.prepend(item);
+      else container.append(item);
+    }
+    item.querySelector(".body").textContent = text;
+    item.classList.toggle("partial", Boolean(partial));
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function systemLine(text) {
+    const item = document.createElement("div");
+    item.className = "line system";
+    item.textContent = text;
+    transcriptEl.append(item);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function safeSend(event) {
+    if (!dc || dc.readyState !== "open" || closing) return false;
+    try {
+      dc.send(JSON.stringify(event));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function fetchTimeout(url, options, ms) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal, credentials: "same-origin" });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function postJson(url, body, timeoutMs) {
+    const response = await fetchTimeout(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }, timeoutMs);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    return await response.json();
+  }
+
+  function reportEvent(type, fields, key, reportedSessionId = sessionId) {
+    if (!reportedSessionId) return Promise.resolve(false);
+    const reportKey = key ? reportedSessionId + ":" + key : "";
+    if (reportKey && reportedEvents.has(reportKey)) return Promise.resolve(true);
+    if (reportKey) reportedEvents.add(reportKey);
+    return postJson("/voice/event", {
+      session_id: reportedSessionId,
+      type,
+      ...fields
+    }, 10000).then(() => true).catch(() => {
+      if (reportKey) reportedEvents.delete(reportKey);
+      return false;
+    });
+  }
+
+  function reportCriticalEvent(type, fields, key) {
+    const reportedSessionId = sessionId;
+    const next = criticalEventTail.then(() => reportEvent(type, fields, key, reportedSessionId));
+    criticalEventTail = next.catch(() => false);
+    return next;
+  }
+
+  function reportTranscript(itemId, transcript) {
+    const stableId = itemId || latestUserItemId || "";
+    const promise = reportEvent("conversation.item.input_audio_transcription.completed", {
+      item_id: stableId,
+      transcript
+    }, "user_transcript:" + stableId);
+    if (stableId) {
+      transcriptReports.set(stableId, promise);
+      const waiter = transcriptWaiters.get(stableId);
+      if (waiter) {
+        transcriptWaiters.delete(stableId);
+        waiter();
+      }
+    }
+    return promise;
+  }
+
+  async function waitForTranscript(itemId) {
+    if (!itemId) return;
+    if (!transcriptReports.has(itemId)) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          transcriptWaiters.delete(itemId);
+          resolve();
+        }, 700);
+        transcriptWaiters.set(itemId, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    const report = transcriptReports.get(itemId);
+    if (report) await report;
+  }
+
+  function cleanup() {
+    runId += 1;
+    ready = false;
+    starting = false;
+    closing = false;
+    muted = false;
+    activeResponseId = "";
+    realtimeSessionId = "";
+    sessionId = "";
+    latestAssistantItemId = "";
+    latestPlaybackResponseId = "";
+    playbackEnabled = false;
+    levelReportPending = false;
+    responseEpochs.clear();
+    responseStatuses.clear();
+    responseTurns.clear();
+    automaticResponseTurns.length = 0;
+    inputEpochs.clear();
+    responseItemIds.clear();
+    playbackEpochs.clear();
+    interruptedResponseIds.clear();
+    turnReports.clear();
+    transcriptReports.clear();
+    transcriptWaiters.clear();
+    for (const pending of pendingTextResponses.values()) clearTimeout(pending.timer);
+    pendingTextResponses.clear();
+    reportedEvents.clear();
+    processedCallIds.clear();
+    criticalEventTail = Promise.resolve(true);
+    if (disconnectTimer) clearTimeout(disconnectTimer);
+    disconnectTimer = null;
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    if (levelTimer) clearInterval(levelTimer);
+    levelTimer = null;
+    if (audioSource) audioSource.disconnect();
+    audioSource = null;
+    if (audioAnalyser) audioAnalyser.disconnect();
+    audioAnalyser = null;
+    try { if (audioContext) void audioContext.close().catch(() => {}); } catch (_) {}
+    audioContext = null;
+    microphone?.getTracks().forEach((track) => track.stop());
+    microphone = null;
+    try { dc?.close(); } catch (_) {}
+    try { pc?.close(); } catch (_) {}
+    dc = null;
+    pc = null;
+    audioEl.srcObject = null;
+    audioEl.classList.remove("visible");
+    app.classList.remove("listening", "speaking");
+    refreshControls();
+  }
+
+  async function closeServerSession(id) {
+    if (!id) return;
+    try { await postJson("/voice/close", { session_id: id }, 6000); } catch (_) {}
+  }
+
+  function connectionLost(message) {
+    if (closing) return;
+    closing = true;
+    interruptionEpoch += 1;
+    const id = sessionId;
+    cleanup();
+    systemLine(message);
+    setStatus("השיחה נותקה", "אפשר להתחיל שיחה חדשה.");
+    void closeServerSession(id);
+  }
+
+  function monitorRemoteAudio(stream) {
+    if (!audioContext || !stream) return;
+    try {
+      audioSource?.disconnect();
+      audioSource = audioContext.createMediaStreamSource(stream);
+      audioAnalyser = audioContext.createAnalyser();
+      audioAnalyser.fftSize = 1024;
+      audioSource.connect(audioAnalyser);
+      const samples = new Uint8Array(audioAnalyser.fftSize);
+      if (levelTimer) clearInterval(levelTimer);
+      levelTimer = setInterval(() => {
+        if (!ready || !audioAnalyser) return;
+        audioAnalyser.getByteTimeDomainData(samples);
+        let energy = 0;
+        for (const sample of samples) {
+          const value = (sample - 128) / 128;
+          energy += value * value;
+        }
+        const level = Math.min(1, Math.sqrt(energy / samples.length) * 3);
+        if (!levelReportPending) {
+          levelReportPending = true;
+          void reportEvent("output_level", { level }).finally(() => { levelReportPending = false; });
+        }
+      }, 150);
+    } catch (_) {
+      // Audio playback still works if this browser has no analyser support.
+    }
+  }
+
+  async function waitForIce(connection) {
+    if (connection.iceGatheringState === "complete") return;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        connection.removeEventListener("icegatheringstatechange", changed);
+        reject(new Error("החיבור למיקרופון ארך יותר מדי זמן."));
+      }, 12000);
+      function changed() {
+        if (connection.iceGatheringState !== "complete") return;
+        clearTimeout(timer);
+        connection.removeEventListener("icegatheringstatechange", changed);
+        resolve();
+      }
+      connection.addEventListener("icegatheringstatechange", changed);
+      changed();
+    });
+  }
+
+  async function handleFunctionCalls(response, epochAtCreation, thisRun) {
+    const calls = (response.output || []).filter((item) => item && item.type === "function_call" && item.call_id);
+    if (!calls.length || response.status !== "completed") {
+      responseTurns.delete(response.id);
+      return;
+    }
+    const responseId = response.id || "";
+    const itemId = responseTurns.get(responseId) || latestUserItemId;
+    const turnEstablished = itemId && turnReports.has(itemId) && await turnReports.get(itemId);
+    if (interruptionEpoch === epochAtCreation) await waitForTranscript(itemId);
+    // A preceding readback may be shown on screen even if its question tail is
+    // interrupted. Flush that presentation before the next turn's tool call.
+    await criticalEventTail;
+    for (const item of calls) {
+      if (processedCallIds.has(item.call_id)) continue;
+      processedCallIds.add(item.call_id);
+      let argumentsValue;
+      try {
+        argumentsValue = JSON.parse(item.arguments || "{}");
+      } catch (_) {
+        argumentsValue = {};
+      }
+      if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) argumentsValue = {};
+      let result;
+      if (runId !== thisRun || !dc || dc.readyState !== "open" || closing) return;
+      if (!turnEstablished) {
+        result = { ok: false, status: "turn_not_recorded" };
+      } else if (interruptionEpoch !== epochAtCreation) {
+        result = { ok: false, status: "interrupted_before_tool" };
+      } else {
+        try {
+          result = await postJson("/voice/tool", {
+            session_id: sessionId,
+            call_id: item.call_id,
+            name: item.name,
+            arguments: argumentsValue,
+            item_id: itemId,
+            response_id: responseId
+          }, 60000);
+        } catch (_) {
+          result = { ok: false, status: "tool_unavailable", message: "הכלי המקומי לא זמין כרגע." };
+        }
+      }
+      if (runId !== thisRun || !dc || dc.readyState !== "open" || closing) return;
+      const output = Object.prototype.hasOwnProperty.call(result, "output") ? result.output : result;
+      safeSend({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: item.call_id,
+          output: typeof output === "string" ? output : JSON.stringify(output)
+        }
+      });
+    }
+    // A user interruption supersedes this tool turn. Keep the factual tool
+    // output in the conversation, but never start a stale spoken response.
+    if (runId === thisRun && !closing && interruptionEpoch === epochAtCreation) {
+      safeSend({ type: "response.create", response: { metadata: { miko_turn_id: itemId, miko_epoch: String(epochAtCreation) } } });
+    }
+    responseTurns.delete(responseId);
+  }
+
+  function handleEvent(event) {
+    const type = event && event.type;
+    if (!type) return;
+    if (type === "conversation.item.added" || type === "conversation.item.created") {
+      const id = event.item?.id || event.item_id || "";
+      const pending = pendingTextResponses.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingTextResponses.delete(id);
+        refreshControls();
+        if (ready && !closing && runId === pending.runId && interruptionEpoch === pending.epoch) {
+          safeSend({ type: "response.create", response: { metadata: { miko_turn_id: id, miko_epoch: String(pending.epoch) } } });
+        }
+      }
+      return;
+    }
+    if (type === "session.created") {
+      realtimeSessionId = event.session?.id || "";
+      ready = true;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(() => {
+        if (ready && sessionId) void reportEvent("heartbeat", {});
+      }, 15000);
+      setStatus(muted ? "המיקרופון מושתק" : "מיקו מקשיב", "דבר בחופשיות. אפשר להפסיק את מיקו בכל רגע.");
+      refreshControls();
+      return;
+    }
+    if (type === "session.updated") {
+      // The server supplied the voice, tools and turn detection at connect time.
+      return;
+    }
+    if (type === "input_audio_buffer.speech_started") {
+      interruptionEpoch += 1;
+      latestUserItemId = event.item_id || latestUserItemId;
+      if (event.item_id) inputEpochs.set(event.item_id, interruptionEpoch);
+      if (event.item_id) {
+        line("owner", event.item_id, "…", true, event.item_id);
+        userLines.get(event.item_id).dataset.placeholder = "1";
+      }
+      app.classList.remove("speaking");
+      setStatus("מיקו מקשיב לך", "אפשר לדבר ולתקן גם באמצע התשובה.");
+      refreshControls();
+      const turnReport = reportCriticalEvent("input_audio_buffer.speech_started", {
+        item_id: event.item_id || "",
+        audio_start_ms: event.audio_start_ms ?? null
+      }, "input_audio_buffer.speech_started:" + (event.item_id || event.event_id || ""));
+      if (event.item_id) turnReports.set(event.item_id, turnReport);
+      return;
+    }
+    if (type === "input_audio_buffer.speech_stopped") {
+      latestUserItemId = event.item_id || latestUserItemId;
+      reportEvent("input_audio_buffer.speech_stopped", {
+        item_id: event.item_id || "",
+        audio_end_ms: event.audio_end_ms ?? null
+      }, "input_audio_buffer.speech_stopped:" + (event.item_id || event.event_id || ""));
+      return;
+    }
+    if (type === "input_audio_buffer.committed") {
+      const previousId = latestUserItemId;
+      latestUserItemId = event.item_id || latestUserItemId;
+      const speechReport = turnReports.get(previousId) || Promise.resolve(false);
+      const commitReport = reportCriticalEvent("input_audio_buffer.committed", {
+        item_id: event.item_id || "",
+        previous_item_id: event.previous_item_id || ""
+      }, "input_audio_buffer.committed:" + (event.item_id || event.event_id || ""));
+      if (event.item_id) {
+        // Preserve the original position if the API gives the committed input
+        // a different ID. STT completion can arrive after Miko's response.
+        const turnId = itemTurns.get(previousId) || previousId || event.item_id;
+        itemTurns.set(event.item_id, turnId);
+        automaticResponseTurns.push({ id: event.item_id, epoch: inputEpochs.get(event.item_id) ?? inputEpochs.get(previousId) ?? interruptionEpoch });
+        if (previousId !== event.item_id && userLines.has(previousId)) {
+          userLines.set(event.item_id, userLines.get(previousId));
+          userLines.delete(previousId);
+        }
+        turnReports.set(event.item_id, Promise.all([speechReport, commitReport]).then((results) => results.every(Boolean)));
+      }
+      return;
+    }
+    if (type === "conversation.item.input_audio_transcription.delta") {
+      const id = event.item_id || latestUserItemId || "user-current";
+      const existing = userLines.get(id)?.dataset.placeholder ? "" : userLines.get(id)?.querySelector(".body")?.textContent || "";
+      line("owner", id, existing + (event.delta || ""), true);
+      delete userLines.get(id).dataset.placeholder;
+      reportCriticalEvent(type, { item_id: id, delta: event.delta || "" }, event.event_id || "");
+      return;
+    }
+    if (type === "conversation.item.input_audio_transcription.completed") {
+      const id = event.item_id || latestUserItemId || "user-current";
+      const text = String(event.transcript || "").trim();
+      if (text) line("owner", id, text, false);
+      reportTranscript(id, text);
+      return;
+    }
+    if (type === "response.created") {
+      const id = event.response?.id || "";
+      const metadata = event.response?.metadata || {};
+      const origin = metadata.miko_turn_id
+        ? { id: metadata.miko_turn_id, epoch: Number(metadata.miko_epoch) }
+        : automaticResponseTurns.shift() || { id: latestUserItemId, epoch: interruptionEpoch };
+      activeResponseId = id;
+      responseEpochs.set(id, origin.epoch);
+      responseTurns.set(id, origin.id);
+      if (origin.epoch !== interruptionEpoch) {
+        interruptedResponseIds.add(id);
+        safeSend({ type: "response.cancel", response_id: id });
+      }
+      reportCriticalEvent("response.created", {
+        response: { id, status: event.response?.status || "in_progress", metadata: { miko_turn_id: origin.id } }
+      }, "response.created:" + (id || event.event_id || ""));
+      return;
+    }
+    if (type === "response.output_audio_transcript.delta") {
+      const id = event.item_id || event.response_id || "miko-current";
+      latestAssistantItemId = id;
+      if (event.response_id) responseItemIds.set(event.response_id, id);
+      const existing = assistantLines.get(id)?.querySelector(".body")?.textContent || "";
+      line("miko", id, existing + (event.delta || ""), true, responseTurns.get(event.response_id));
+      reportCriticalEvent(type, { item_id: id, response_id: event.response_id || "", delta: event.delta || "" }, event.event_id || "");
+      return;
+    }
+    if (type === "response.output_audio_transcript.done") {
+      const id = event.item_id || event.response_id || "miko-current";
+      latestAssistantItemId = id;
+      if (event.response_id) responseItemIds.set(event.response_id, id);
+      const text = String(event.transcript || assistantLines.get(id)?.querySelector(".body")?.textContent || "").trim();
+      if (text) line("miko", id, text, false, responseTurns.get(event.response_id));
+      reportCriticalEvent("response.output_audio_transcript.done", {
+        item_id: id,
+        response_id: event.response_id || "",
+        transcript: text
+      }, "response.output_audio_transcript.done:" + id);
+      const shownLine = assistantLines.get(id);
+      if (text && shownLine?.isConnected && document.visibilityState === "visible") {
+        // This asserts only that the final transcript is reviewable on screen.
+        // The server independently checks the real draft's address and body.
+        reportCriticalEvent("output_text_presented", {
+          item_id: id,
+          response_id: event.response_id || ""
+        }, "output_text_presented:" + id);
+      }
+      return;
+    }
+    if (type === "response.output_text.delta") {
+      const id = event.item_id || event.response_id || "miko-text-current";
+      if (event.response_id && event.item_id) responseItemIds.set(event.response_id, event.item_id);
+      const existing = assistantLines.get(id)?.querySelector(".body")?.textContent || "";
+      line("miko", id, existing + (event.delta || ""), true, responseTurns.get(event.response_id));
+      return;
+    }
+    if (type === "response.output_text.done") {
+      const id = event.item_id || event.response_id || "miko-text-current";
+      if (event.response_id && event.item_id) responseItemIds.set(event.response_id, event.item_id);
+      const text = String(event.text || assistantLines.get(id)?.querySelector(".body")?.textContent || "").trim();
+      if (text) line("miko", id, text, false, responseTurns.get(event.response_id));
+      reportEvent("response.output_text.done", {
+        item_id: id,
+        response_id: event.response_id || "",
+        text
+      }, "response.output_text.done:" + id);
+      return;
+    }
+    if (type === "output_audio_buffer.started") {
+      latestPlaybackResponseId = event.response_id || activeResponseId;
+      if (latestPlaybackResponseId) playbackEpochs.set(latestPlaybackResponseId, interruptionEpoch);
+      app.classList.add("speaking");
+      app.classList.remove("listening");
+      setStatus("מיקו מדבר", "אפשר להתפרץ לשיחה ולתקן אותו.");
+      reportCriticalEvent("output_audio_buffer.started", {
+        item_id: responseItemIds.get(latestPlaybackResponseId) || "",
+        response_id: latestPlaybackResponseId
+      }, "output_audio_buffer.started:" + (event.event_id || latestPlaybackResponseId));
+      return;
+    }
+    if (type === "output_audio_buffer.stopped") {
+      const responseId = event.response_id || latestPlaybackResponseId;
+      const itemId = responseItemIds.get(responseId) || "";
+      const audible = Boolean(
+        playbackEnabled && !audioEl.paused && !audioEl.muted && audioEl.volume > 0 &&
+        pc?.connectionState === "connected" &&
+        responseStatuses.get(responseId) === "completed" &&
+        !interruptedResponseIds.has(responseId)
+      );
+      app.classList.remove("speaking");
+      setStatus(muted ? "המיקרופון מושתק" : "מיקו מקשיב");
+      refreshControls();
+      reportCriticalEvent("playback_diagnostic", {
+        response_id: responseId,
+        item_id: itemId,
+        audible,
+        playbackEnabled,
+        paused: audioEl.paused,
+        muted: audioEl.muted,
+        volume: audioEl.volume,
+        pcState: pc?.connectionState || "none",
+        interrupted: interruptedResponseIds.has(responseId),
+        epochMatches: playbackEpochs.get(responseId) === interruptionEpoch
+      }, "playback_diagnostic:" + (event.event_id || responseId));
+      reportCriticalEvent("output_audio_buffer.stopped", {
+        item_id: itemId,
+        response_id: responseId,
+        audible
+      }, "output_audio_buffer.stopped:" + (event.event_id || responseId));
+      if (latestPlaybackResponseId === responseId) latestPlaybackResponseId = "";
+      responseItemIds.delete(responseId);
+      responseStatuses.delete(responseId);
+      playbackEpochs.delete(responseId);
+      interruptedResponseIds.delete(responseId);
+      return;
+    }
+    if (type === "output_audio_buffer.cleared") {
+      const responseId = event.response_id || latestPlaybackResponseId;
+      if (responseId) interruptedResponseIds.add(responseId);
+      app.classList.remove("speaking");
+      setStatus(muted ? "המיקרופון מושתק" : "מיקו מקשיב");
+      refreshControls();
+      reportCriticalEvent("output_audio_buffer.cleared", {
+        item_id: responseItemIds.get(responseId) || "",
+        response_id: responseId
+      }, "output_audio_buffer.cleared:" + (event.event_id || responseId));
+      if (latestPlaybackResponseId === responseId) latestPlaybackResponseId = "";
+      return;
+    }
+    if (type === "response.done") {
+      const response = event.response || {};
+      if (response.id) responseStatuses.set(response.id, response.status || "");
+      if (!responseItemIds.has(response.id)) {
+        const message = (response.output || []).find((item) => item && item.type === "message" && item.id);
+        if (message) responseItemIds.set(response.id, message.id);
+      }
+      if (response.id === activeResponseId) activeResponseId = "";
+      const epoch = responseEpochs.get(response.id) ?? interruptionEpoch;
+      responseEpochs.delete(response.id);
+      reportCriticalEvent("response.done", {
+        response: {
+          id: response.id || "",
+          status: response.status || "",
+          output: (response.output || []).filter((item) => item && item.type === "function_call")
+            .map((item) => ({ type: "function_call", name: item.name, call_id: item.call_id }))
+        }
+      }, "response.done:" + (response.id || event.event_id || ""));
+      if (response.status === "completed") {
+        void handleFunctionCalls(response, epoch, runId);
+      } else {
+        responseTurns.delete(response.id);
+      }
+      return;
+    }
+    if (type === "error") {
+      const message = String(event.error?.message || "שגיאת חיבור");
+      for (const [id, pending] of pendingTextResponses) {
+        clearTimeout(pending.timer);
+        pendingTextResponses.delete(id);
+        if (latestUserItemId === id) latestUserItemId = pending.previousUserItemId;
+        systemLine("ההודעה הכתובה לא נוספה לשיחה. אפשר לנסות שוב.");
+        reportCriticalEvent("interrupted", { item_id: id, reason: "text_item_rejected" }, "text_item_rejected:" + id);
+      }
+      refreshControls();
+      systemLine("שגיאת שירות: " + message);
+      setStatus("יש בעיית חיבור", "אפשר לנסות שוב או להמשיך לדבר.");
+      reportCriticalEvent("error", { error: { message } }, "error:" + (event.event_id || ""));
+    }
+  }
+
+  async function start() {
+    if (starting || ready) return;
+    starting = true;
+    closing = false;
+    const thisRun = ++runId;
+    setStatus("מתחבר למיקו…", "כעת תתבקש הרשאה למיקרופון.");
+    refreshControls();
+    try {
+      const AudioContextType = window.AudioContext || window.webkitAudioContext;
+      if (AudioContextType) {
+        try {
+          audioContext = new AudioContextType();
+          void audioContext.resume().catch(() => {});
+        } catch (_) {
+          audioContext = null;
+        }
+      }
+      const configResponse = await fetchTimeout("/voice/config", { method: "GET" }, 7000);
+      if (runId !== thisRun) return;
+      if (configResponse.ok) {
+        const config = await configResponse.json();
+        if (runId !== thisRun) return;
+        $("modelBadge").textContent = (config.synthetic_test ? "בדיקה · שליחה מדומה · " : "") + "קול: " + String(config.voice || "cedar");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1
+        }
+      });
+      if (runId !== thisRun) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      microphone = stream;
+      const connection = new RTCPeerConnection();
+      pc = connection;
+      connection.addEventListener("track", (event) => {
+        if (runId !== thisRun) return;
+        const remoteStream = event.streams[0] || new MediaStream([event.track]);
+        audioEl.srcObject = remoteStream;
+        monitorRemoteAudio(remoteStream);
+        audioEl.play().then(() => {
+          if (runId === thisRun) playbackEnabled = true;
+        }).catch(() => {
+          if (runId !== thisRun) return;
+          playbackEnabled = false;
+          audioEl.classList.add("visible");
+          detailEl.textContent = "הדפדפן חסם השמעה אוטומטית. לחץ על נגן השמע למטה.";
+        });
+      });
+      connection.addEventListener("connectionstatechange", () => {
+        if (runId !== thisRun || closing) return;
+        if (connection.connectionState === "failed") {
+          connectionLost("החיבור הקולי נותק.");
+        } else if (connection.connectionState === "disconnected") {
+          setStatus("מנסה לחדש חיבור…");
+          if (disconnectTimer) clearTimeout(disconnectTimer);
+          disconnectTimer = setTimeout(() => {
+            if (runId === thisRun && connection.connectionState === "disconnected") {
+              connectionLost("החיבור הקולי לא התחדש.");
+            }
+          }, 8000);
+        } else if (connection.connectionState === "connected" && disconnectTimer) {
+          clearTimeout(disconnectTimer);
+          disconnectTimer = null;
+          if (ready) setStatus(muted ? "המיקרופון מושתק" : "מיקו מקשיב");
+        }
+      });
+      for (const track of microphone.getAudioTracks()) connection.addTrack(track, microphone);
+      dc = connection.createDataChannel("oai-events");
+      dc.addEventListener("message", ({ data }) => {
+        if (runId !== thisRun) return;
+        try { handleEvent(JSON.parse(data)); } catch (_) {}
+      });
+      dc.addEventListener("close", () => {
+        if (runId !== thisRun || closing) return;
+        connectionLost("ערוץ השיחה נסגר.");
+      });
+      const offer = await connection.createOffer();
+      if (runId !== thisRun) return;
+      await connection.setLocalDescription(offer);
+      await waitForIce(connection);
+      if (runId !== thisRun) return;
+      const sdp = connection.localDescription?.sdp;
+      if (!sdp) throw new Error("לא נוצר חיבור קול.");
+      const answerResponse = await fetchTimeout("/voice/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: sdp
+      }, 25000);
+      if (runId !== thisRun) {
+        await closeServerSession(answerResponse.headers.get("X-Miko-Session") || "");
+        return;
+      }
+      if (!answerResponse.ok) throw new Error("השרת לא הצליח לפתוח שיחה (" + answerResponse.status + ").");
+      sessionId = answerResponse.headers.get("X-Miko-Session") || "";
+      if (!sessionId) throw new Error("מזהה השיחה חסר בתשובת השרת.");
+      const answer = await answerResponse.text();
+      await connection.setRemoteDescription({ type: "answer", sdp: answer });
+      if (runId !== thisRun) return;
+      starting = false;
+      if (!ready) setStatus("ממתין לחיבור הקולי…", "אפשר לדבר כשהמצב משתנה ל׳מיקו מקשיב׳.");
+      refreshControls();
+    } catch (error) {
+      if (runId !== thisRun) return;
+      const message = error instanceof Error ? error.message : "שגיאת חיבור";
+      const id = sessionId;
+      cleanup();
+      setStatus("לא הצלחנו להתחבר", message);
+      systemLine("החיבור לא נפתח: " + message);
+      await closeServerSession(id);
+    }
+  }
+
+  async function stop() {
+    if ((!ready && !starting) || closing) return;
+    interruptionEpoch += 1;
+    setStatus("מסיים שיחה…");
+    const closingSession = sessionId;
+    if (activeResponseId) safeSend({ type: "response.cancel", response_id: activeResponseId });
+    if (latestPlaybackResponseId || app.classList.contains("speaking")) {
+      safeSend({ type: "output_audio_buffer.clear" });
+    }
+    closing = true;
+    cleanup();
+    setStatus("השיחה הסתיימה", "אפשר להתחיל שיחה חדשה.");
+    await closeServerSession(closingSession);
+  }
+
+  startButton.addEventListener("click", start);
+  stopButton.addEventListener("click", stop);
+  muteButton.addEventListener("click", () => {
+    if (!microphone || !ready) return;
+    muted = !muted;
+    microphone.getAudioTracks().forEach((track) => { track.enabled = !muted; });
+    setStatus(muted ? "המיקרופון מושתק" : "מיקו מקשיב");
+    refreshControls();
+  });
+  interruptButton.addEventListener("click", () => {
+    if (!ready) return;
+    interruptionEpoch += 1;
+    if (latestPlaybackResponseId) interruptedResponseIds.add(latestPlaybackResponseId);
+    if (activeResponseId) safeSend({ type: "response.cancel", response_id: activeResponseId });
+    if (latestPlaybackResponseId || app.classList.contains("speaking")) {
+      safeSend({ type: "output_audio_buffer.clear" });
+    }
+    app.classList.remove("speaking");
+    setStatus(muted ? "המיקרופון מושתק" : "מיקו מקשיב", "מיקו עצר. אפשר להמשיך לדבר.");
+    refreshControls();
+    reportCriticalEvent("interrupted", { response_id: activeResponseId || latestPlaybackResponseId || "" });
+  });
+  audioEl.addEventListener("play", () => {
+    playbackEnabled = true;
+    if (audioContext?.state === "suspended") void audioContext.resume().catch(() => {});
+  });
+  audioEl.addEventListener("pause", () => { playbackEnabled = false; });
+  textForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = textInput.value.trim();
+    if (!text || !ready || pendingTextResponses.size) return;
+    textInput.value = "";
+    const thisRun = runId;
+    const clientTurnId = "msg_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+    const clientEventId = "evt_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+    line("owner", clientTurnId, text, false);
+    const report = reportCriticalEvent("text_input", { item_id: clientTurnId, text }, "text_input:" + clientTurnId);
+    turnReports.set(clientTurnId, report);
+    transcriptReports.set(clientTurnId, report);
+    if (!await report) {
+      systemLine("לא ניתן לשמור את ההודעה. נסה שוב.");
+      if (runId === thisRun && !textInput.value) textInput.value = text;
+      return;
+    }
+    if (runId !== thisRun || !ready || closing) return;
+    const previousUserItemId = latestUserItemId;
+    latestUserItemId = clientTurnId;
+    const timer = setTimeout(() => {
+      if (!pendingTextResponses.has(clientTurnId)) return;
+      pendingTextResponses.delete(clientTurnId);
+      if (latestUserItemId === clientTurnId) latestUserItemId = previousUserItemId;
+      systemLine("ההודעה לא אושרה על ידי שירות הקול. אפשר לנסות שוב.");
+      reportCriticalEvent("interrupted", { item_id: clientTurnId, reason: "text_item_timeout" }, "text_item_timeout:" + clientTurnId);
+      refreshControls();
+    }, 10000);
+    pendingTextResponses.set(clientTurnId, {
+      clientEventId,
+      previousUserItemId,
+      epoch: interruptionEpoch,
+      runId: thisRun,
+      timer
+    });
+    refreshControls();
+    const created = safeSend({
+      type: "conversation.item.create",
+      event_id: clientEventId,
+      item: { id: clientTurnId, type: "message", role: "user", content: [{ type: "input_text", text }] }
+    });
+    if (!created) {
+      clearTimeout(timer);
+      pendingTextResponses.delete(clientTurnId);
+      latestUserItemId = previousUserItemId;
+      if (!textInput.value) textInput.value = text;
+      systemLine("לא ניתן לשלוח את ההודעה לשיחת הקול.");
+      reportCriticalEvent("interrupted", { item_id: clientTurnId, reason: "text_item_send_failed" }, "text_item_send_failed:" + clientTurnId);
+      refreshControls();
+    }
+  });
+  window.addEventListener("beforeunload", () => {
+    if (!sessionId) return;
+    navigator.sendBeacon?.("/voice/close", new Blob([
+      JSON.stringify({ session_id: sessionId })
+    ], { type: "application/json" }));
+  });
+  refreshControls();
+})();
+</script>
+</body>
+</html>

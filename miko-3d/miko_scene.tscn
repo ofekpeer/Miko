@@ -1,0 +1,8 @@
+[gd_scene format=3 uid="uid://cuwci84be5elv"]
+
+[ext_resource type="PackedScene" uid="uid://dgcdes868lk8o" path="res://Miko.glb" id="1_ls480"]
+
+[node name="MikoScene" unique_id=1866504474 instance=ExtResource("1_ls480")]
+transform = Transform3D(1.5, 0, 0, 0, 1.5, 0, 0, 0, 1.5, 0, 0, 0)
+
+[node name="MikoHolder" type="Node3D" parent="." index="2" unique_id=1732016550]

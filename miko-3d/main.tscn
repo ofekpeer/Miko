@@ -1,0 +1,22 @@
+[gd_scene format=3 uid="uid://dd0dqm2a8t2jy"]
+
+[ext_resource type="Script" uid="uid://dslau6oi3gyao" path="res://miko_controller.gd" id="1_0xm2m"]
+[ext_resource type="PackedScene" path="res://characters/robot/miko_robot.tscn" id="1_ig7tw"]
+[ext_resource type="Script" path="res://miko_presence.gd" id="2_presence"]
+
+[node name="MikoWorld" type="Node3D" unique_id=436071643]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+script = ExtResource("1_0xm2m")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=72526132]
+transform = Transform3D(0.66531456, 0, -0.04243782, 0, 0.6666666, 0, 0.04243782, 0, 0.66531456, 0.692883, 0.9843943, 4)
+fov = 59.79869
+metadata/_edit_group_ = true
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1249351270]
+
+[node name="MikoScene" parent="." unique_id=1128409556 instance=ExtResource("1_ig7tw")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.6555867, 0, 1.4606371)
+
+[node name="Presence" type="Node3D" parent="."]
+script = ExtResource("2_presence")

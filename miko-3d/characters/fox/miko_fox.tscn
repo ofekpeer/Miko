@@ -1,0 +1,10 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://characters/fox/miko_fox_character.gd" id="1_foxscript"]
+[ext_resource type="PackedScene" path="res://characters/fox/MikoFox.glb" id="2_foxmodel"]
+
+[node name="MikoFox" type="Node3D"]
+script = ExtResource("1_foxscript")
+
+[node name="Model" parent="." instance=ExtResource("2_foxmodel")]
+transform = Transform3D(1.65, 0, 0, 0, 1.65, 0, 0, 0, 1.65, 0, -0.168, 0)

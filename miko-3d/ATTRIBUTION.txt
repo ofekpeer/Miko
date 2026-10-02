@@ -1,0 +1,10 @@
+Original 3D model metadata found in the uploaded GLB:
+Title: Robot_008
+Author: evolver55555 (https://sketchfab.com/evolver55555)
+Source: https://sketchfab.com/3d-models/robot-008-d959b94b03a8432f81aa60f0bd7ca4e3
+License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+
+Adaptation for Miko:
+The uploaded model was reorganized into functional wheel, eye, mouth and body nodes,
+re-tinted for the Miko identity, and given Miko action animations for use in Godot.
+The original attribution metadata is also retained in the GLB asset metadata.

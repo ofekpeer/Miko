@@ -1,0 +1,20 @@
+BACKGROUND ASSET ATTRIBUTION
+
+Source asset:
+"Sci-Fi Modular Terminal Toolkit"
+
+Author:
+Inditrion Dradnon
+https://sketchfab.com/dradnon
+
+Original source:
+https://sketchfab.com/3d-models/sci-fi-modular-terminal-toolkit-6f515945b5db4118a8a57c734145d8f1
+
+License:
+CC BY 4.0
+http://creativecommons.org/licenses/by/4.0/
+
+Adaptation:
+The raw modular showcase layout is not used as a complete room.
+Selected texture/screen artwork from the uploaded GLB is used to build
+a new Miko sci-fi companion room in Godot.
