@@ -66,9 +66,11 @@ def main() -> int:
     print("\nLook at the camera, then wave hello beside your face. Press Q to finish.\n")
     seen_once = waved = False
     frames = 0
+    gui = True               # opencv-python-headless has no preview window
+    last_report = 0.0
     started = time.monotonic()
     try:
-        while time.monotonic() - started < 120:
+        while time.monotonic() - started < (120 if gui else 30):
             ok, frame = capture.read()
             if not ok:
                 continue
@@ -78,6 +80,14 @@ def main() -> int:
                        "wave": "**  you waved - Miko waves back", "approached": "**  you came closer"}.get(name, name))
                 seen_once |= name == "arrived"
                 waved |= name == "wave"
+            now = time.monotonic()
+            if not gui and now - last_report >= 2.0:
+                last_report = now
+                summary = engine.summary()
+                print("    face:", (summary.get("where", "") + ", " + summary.get("distance", "")) if summary["seen"] else "not visible",
+                      "| %ds left" % max(0, 30 - int(now - started)))
+            if not gui:
+                continue
             view = frame.copy()
             if engine.seen and engine.face is not None:
                 h, w = view.shape[:2]
@@ -85,8 +95,14 @@ def main() -> int:
                 x0, y0 = int((f.cx - f.w / 2) * w), int((f.cy - f.h / 2) * h)
                 cv2.rectangle(view, (x0, y0), (x0 + int(f.w * w), y0 + int(f.h * h)), (80, 220, 120), 2)
             cv2.putText(view, "Miko camera check - Q to finish", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.imshow("Miko camera check", cv2.flip(view, 1))
-            key = cv2.waitKey(1) & 0xFF
+            try:
+                cv2.imshow("Miko camera check", cv2.flip(view, 1))
+                key = cv2.waitKey(1) & 0xFF
+            except cv2.error:
+                gui = False
+                started = time.monotonic()
+                print("..  (no preview window in this OpenCV build - checking in text mode for 30 seconds)")
+                continue
             frames += 1
             # Closing the preview window also finishes (checked once it is up).
             closed = frames > 15 and cv2.getWindowProperty("Miko camera check", cv2.WND_PROP_VISIBLE) < 1
@@ -94,7 +110,11 @@ def main() -> int:
                 break
     finally:
         capture.release()
-        cv2.destroyAllWindows()
+        if gui:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
     print()
     print("Face seen:", "yes" if seen_once else "no", "| wave detected:", "yes" if waved else "no")
     print("Camera works. Restart Miko (Stop Miko.cmd, then Start Miko.cmd) so it uses it.")
