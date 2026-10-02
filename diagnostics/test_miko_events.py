@@ -303,6 +303,31 @@ class CameraScenes(unittest.TestCase):
             self.assertEqual(events.count("shake_started"), 1, events)
             self.assertNotIn("wave", events)
 
+    @unittest.skipUnless(miko_vision.miko_perception is not None and miko_vision.miko_perception.available(),
+                         "MediaPipe not installed")
+    def test_G_a_real_hand_waving_near_the_camera_is_a_wave_not_a_shake(self):
+        """Real photos through MediaPipe: a big hand close to the lens used
+        to look like the camera moving (false shake, wave suppressed)."""
+        import cv2
+        data = Path(__file__).parent / "data"
+        face = cv2.resize(cv2.imread(str(data / "face_sample.jpg")), (180, 180))
+        for photo in ("victory", "pointing_up"):
+            for size in (170, 240):
+                hand = cv2.resize(cv2.imread(str(data / f"gesture_{photo}.jpg")), (size, size))
+                engine = miko_vision.VisionEngine()
+
+                def scene(hx=None):
+                    img = self.tv._ROOM.copy()
+                    img[150:330, 120:300] = face
+                    if hx is not None:
+                        img[20:20 + size, int(hx):int(hx) + size] = hand
+                    return img
+                self.run_frames(engine, [scene()] * 8)
+                frames = [scene(640 - size - 60 + 50 * math.sin(2 * math.pi * 2.0 * i / 15.0)) for i in range(36)]
+                events = self.run_frames(engine, frames, start=1.0)
+                self.assertEqual(events.count("wave"), 1, (photo, size, events))
+                self.assertFalse([e for e in events if e.startswith("shake")], (photo, size, events))
+
     def test_A_still_camera_with_noise_gives_no_physical_events(self):
         import numpy as np
         rng = np.random.default_rng(5)

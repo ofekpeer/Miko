@@ -17,6 +17,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 
+CHECK_VERSION = "17.8"
+
 def ensure_opencv() -> bool:
     import miko_deps
     sight = miko_deps.ensure_vision_packages()

@@ -143,6 +143,8 @@ class VisionEngine:
         self._last_hand: HandSample | None = None
         self._hand_seen_at = -1e9
         self._jolt_flip = False
+        self._hand_boxes: list = []
+        self._blob_box = None
         self._last_motion = -1e9
         self._last_light = -1e9
         self._face_change_at = -1e9
@@ -217,6 +219,10 @@ class VisionEngine:
         if self.mp is not None:
             started = time.perf_counter()
             obs = self.mp.process(frame, now)
+            if obs.hands_checked:
+                # Hands are not the room either: a hand waving close to the
+                # camera must not look like the camera moving.
+                self._hand_boxes = [self._hand_box(h) for h in obs.hands]
             self._cost.append(time.perf_counter() - started)
             # Slow machine: look at hands every other frame to keep the pace.
             if len(self._cost) == self._cost.maxlen:
@@ -293,6 +299,14 @@ class VisionEngine:
             out.append(self._event(now, name, **event))
         return out
 
+    @staticmethod
+    def _hand_box(h) -> tuple[float, float, float, float]:
+        points = [h.wrist] + ([h.tips] if h.tips else []) + ([h.center] if h.center else [])
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+        half = max(0.07, 1.8 * float(h.size or 0.0))
+        return cx - half, cy - half * 1.3, cx + half, cy + half * 1.3
+
     # ------------------------------------------------------------ waves
     def _face_sample(self, now: float) -> FaceSample | None:
         if not self.seen or self.face is None:
@@ -365,6 +379,9 @@ class VisionEngine:
             x0, x1 = int((f.cx - 1.8 * f.w) * W), int((f.cx + 1.8 * f.w) * W)
             y0 = int((f.cy - 1.2 * f.h) * H)
             mask[max(0, y0):, max(0, x0):max(0, x1)] = False
+        for box in self._hand_boxes:                # a raised hand is not the room
+            bx0, by0, bx1, by1 = box
+            mask[max(0, int(by0 * H)):max(0, int(by1 * H)), max(0, int(bx0 * W)):max(0, int(bx1 * W))] = False
         area = float(mask.mean())
         out = []
         if area > 0.03 and self._quiet:
@@ -438,6 +455,11 @@ class VisionEngine:
             x0, x1 = int((f.cx - 1.4 * f.w) * W), int((f.cx + 1.4 * f.w) * W)
             y0 = int((f.cy - 1.6 * f.h) * H)
             mask[max(0, y0):, max(0, x0):max(0, x1)] = 0.0
+        # Hands seen by the hand model, and the moving blob of the last steady
+        # frame (a hand the model missed).
+        for box in list(self._hand_boxes) + ([self._blob_box] if self._blob_box else []):
+            x0, y0, x1, y1 = box
+            mask[max(0, int(y0 * H)):max(0, int(y1 * H)), max(0, int(x0 * W)):max(0, int(x1 * W))] = 0.0
         return mask
 
     def _global_motion(self, prev, gray) -> tuple[tuple[float, float], float]:
@@ -457,14 +479,19 @@ class VisionEngine:
         room = mask > 0.5
         if float(room.mean()) < 0.15:
             return (0.0, 0.0), 0.0                 # the person fills the view: unknowable
+        # Six regions: left/right halves of the left and right thirds, and the
+        # top band. Camera motion moves all of them; a hand or head only some.
         zones = []
-        for zone in (np.s_[:, : W // 3], np.s_[:, 2 * W // 3:], np.s_[: H // 3, W // 4: 3 * W // 4]):
+        regions = [("L", np.s_[: H // 2, : W // 3]), ("L", np.s_[H // 2:, : W // 3]),
+                   ("R", np.s_[: H // 2, 2 * W // 3:]), ("R", np.s_[H // 2:, 2 * W // 3:]),
+                   ("T", np.s_[: H // 3, W // 3: W // 2]), ("T", np.s_[: H // 3, W // 2: 2 * W // 3])]
+        for side, region in regions:
             z = np.zeros_like(room)
-            z[zone] = True
+            z[region] = True
             z &= room
-            if float(z.mean()) >= 0.03:
-                zones.append(z)
-        if len(zones) < 2:
+            if float(z.mean()) >= 0.015:
+                zones.append((side, z))
+        if len({side for side, _ in zones}) < 2:
             return (0.0, 0.0), 0.0
         diff = cv2.absdiff(prev, gray).astype(np.float32)
         window = self._hann * cv2.blur(mask, (9, 9))
@@ -476,22 +503,26 @@ class VisionEngine:
             m = int(math.ceil(shift)) + 2
             edge = np.zeros_like(room)
             edge[m:-m, m:-m] = True
-            agreeing = 0
-            for z in zones:
+            agreeing, still, sides = 0, 0, set()
+            for side, z in zones:
                 zz = z & edge
                 if not zz.any():
                     continue
                 raw = float(diff[zz].mean())
                 if raw > 1.0 and float(aligned[zz].mean()) < 0.7 * raw:
                     agreeing += 1
-            if agreeing >= 2:
+                    sides.add(side)
+                elif raw < 0.5 and float(gray[zz].std()) > 8.0:
+                    still += 1                       # textured and unchanged: the camera did not move
+            if agreeing >= 3 and len(sides) >= 2 and agreeing > still:
                 return (sx, sy), 1.0
         # Blur: most zones changed a lot at once while the brightness stayed
         # (a light switching or the lens being covered changes brightness).
         if abs(float(gray.mean()) - float(prev.mean())) > 12.0 or float(gray.std()) < 10.0 or float(prev.std()) < 10.0:
             return (0.0, 0.0), 0.0
-        busy = sum(1 for z in zones if float(diff[z].mean()) > 4.0)
-        if busy >= 2 and busy >= len(zones) - 1:
+        busy_sides = {side for side, z in zones if float(diff[z].mean()) > 4.0}
+        busy = sum(1 for side, z in zones if float(diff[z].mean()) > 4.0)
+        if busy >= 3 and len(busy_sides) >= 2 and busy >= len(zones) - 1:
             if shift < 0.5:
                 sx, sy = (3.0, 0.0) if self._jolt_flip else (-3.0, 0.0)
                 self._jolt_flip = not self._jolt_flip
@@ -543,6 +574,7 @@ class VisionEngine:
             moving[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = False
         area = float(moving.mean())
         self._quiet = area < 0.02
+        self._blob_box = None
         sample = None
         cx = 0.5
         if area >= 0.004:
@@ -561,6 +593,9 @@ class VisionEngine:
                     if blob.any():
                         vx = float(np.median(local_x[blob]))
                         vy = float(np.median(np.abs(local_y[blob])))
+                        left, top = stats[index, cv2.CC_STAT_LEFT], stats[index, cv2.CC_STAT_TOP]
+                        bw, bh = stats[index, cv2.CC_STAT_WIDTH], stats[index, cv2.CC_STAT_HEIGHT]
+                        self._blob_box = ((left - 4) / W, (top - 4) / H, (left + bw + 4) / W, (top + bh + 4) / H)
                         if abs(vx) > 0.9 * vy:            # mostly sideways
                             bx, by = float(centers[index][0]) / W, float(centers[index][1]) / H
                             sample = HandSample(now, bx, by, 0.1, -1.0, "", bx)
@@ -715,6 +750,11 @@ class VisionService:
     def open_webcam():
         """Try the usual Windows backends and the first camera indices; return
         (capture, description) for the first one that delivers a frame."""
+        video = os.environ.get("MIKO_CAMERA_FILE", "").strip()
+        if video:                                  # diagnostics: a recorded video as the webcam
+            capture = cv2.VideoCapture(video)
+            if capture.isOpened():
+                return capture, f"video file {os.path.basename(video)}"
         wanted = os.environ.get("MIKO_CAMERA_INDEX", "").strip()
         indices = [int(wanted)] if wanted.isdigit() else [0, 1, 2]
         backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if os.name == "nt" else [cv2.CAP_ANY]
@@ -753,6 +793,9 @@ class VisionService:
         self._status()
         print("MIKO VISION: webcam on,", description, "- frames stay in memory on this computer")
         failures = 0
+        errors = 0
+        frames = 0
+        beat_at = time.monotonic()
         try:
             next_at = 0.0
             while not self._stop.is_set():
@@ -760,10 +803,16 @@ class VisionService:
                 if not ok:
                     failures += 1
                     if failures > 50:                   # camera went away: reopen
+                        log("RECOVERY", "webcam stopped delivering frames; reopening")
                         break
                     time.sleep(0.2)
                     continue
                 failures = 0
+                if description.startswith("video file"):
+                    time.sleep(1.0 / 15.0)               # play a recorded video at camera pace
+                if time.monotonic() - beat_at >= 30.0:
+                    self._heartbeat(frames, time.monotonic() - beat_at, errors)
+                    beat_at, frames, errors = time.monotonic(), 0, 0
                 # A paired device camera takes over while it streams.
                 if time.monotonic() - self._device_frames_at < 2.0:
                     continue
@@ -771,7 +820,16 @@ class VisionService:
                 if now < next_at:
                     continue
                 next_at = now + 0.06                    # ~15 fps analysis (waves are fast)
-                self.feed_frame(frame, now)
+                try:
+                    self.feed_frame(frame, now)
+                    frames += 1
+                except Exception as error:
+                    # One bad frame must never kill sight for the rest of the
+                    # session (before, the camera thread died silently here).
+                    errors += 1
+                    import traceback
+                    throttled("vision_frame_error", 10.0, "RECOVERY", "frame analysis failed; camera keeps running",
+                              error=type(error).__name__, where=traceback.format_exc().strip().splitlines()[-2].strip()[:120])
         finally:
             capture.release()
             if self.source == "webcam":
@@ -792,6 +850,17 @@ class VisionService:
             self._status()
         self._device_frames_at = time.monotonic()
         self.feed_frame(frame, self._device_frames_at)
+
+    def _heartbeat(self, frames: int, seconds: float, errors: int) -> None:
+        """Every 30 s: is sight actually working? (frames, faces, camera state)."""
+        with self.lock:
+            engine = self.engine
+            seen = bool(engine and engine.seen)
+            stable = bool(engine.camera_stable) if engine else False
+            mp = bool(engine and engine.mp)
+            energy = round(engine.physical.energy, 2) if engine else 0.0
+        log("PERCEPTION", "sight heartbeat", fps=round(frames / max(seconds, 0.1), 1), face_seen=seen,
+            camera_steady=stable, motion_energy=energy, mediapipe=mp, errors=errors, source=self.source)
 
     def feed_imu(self, samples, now: float | None = None) -> None:
         """Motion samples from the paired device's IMU: (t, ax, ay, az, gx,
