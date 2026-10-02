@@ -39,7 +39,12 @@ def ensure_opencv() -> bool:
         return False
 
 
+CHECK_VERSION = "17.4.3"   # loads the face model from memory (Hebrew paths OK)
+
+
 def main() -> int:
+    print("Miko camera check", CHECK_VERSION)
+    print("Folder:", HERE)
     print("Python:", sys.executable, sys.version.split()[0])
     if not ensure_opencv():
         return 1
