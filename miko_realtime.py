@@ -183,6 +183,7 @@ class VoiceState:
             self.turn_numbers[self.turn_id] = self.turn_number
             self.audio_input = audio
             self.last_user = text
+            self.turn_started_at = time.time()
             self.awaiting_draft = None
             # Keep originating readbacks until their playback outcome arrives.
             # An actual clear/interrupt discards unplayed associations below.
@@ -744,6 +745,12 @@ class NativeSession:
         self.device_id = ''
         self.camera_results = {}
         self.pending_responses = {}
+        # response.create requests by id (options, spontaneous?) so a request
+        # that collides with an active response can be retried, not lost.
+        self.request_options = {}
+        self.deferred_requests = deque()
+        self.ptt_active = False
+        self.response_items = {}
         self.pending_commits = deque()
         self.automatic_responses = deque()
         self.discard_responses = set()
@@ -768,10 +775,50 @@ class NativeSession:
         self.pending_responses[request_id] = (origin_turn or self.state.turn_id,self.generation,copy.copy(self.state.tools))
         options = dict(response or {})
         options['metadata'] = {**options.get('metadata',{}),'miko_request_id':request_id}
-        await self.api_send({'type':'response.create','response':options})
+        self.request_options[request_id] = (options, bool(origin_turn and origin_turn.startswith('auto_')), self.generation)
+        if len(self.request_options) > 64:
+            self.request_options.pop(next(iter(self.request_options)))
+        await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
+
+    async def _response_rejected(self, request_id):
+        """The model refused a response.create because another response was
+        still active (e.g. Miko's own remark started just as the owner spoke).
+        Drop Miko's own remark; retry the owner's answer once the active
+        response ends (cancelling a spontaneous one so the owner goes first)."""
+        options, spontaneous, generation = self.request_options.get(request_id, (None, True, -1))
+        if spontaneous or options is None or generation != self.generation:
+            self.pending_responses.pop(request_id, None)
+            return
+        if request_id not in self.deferred_requests:
+            self.deferred_requests.append(request_id)
+        active = self.active_response_id
+        if active and active in self.state.response_turns and str(self.state.response_turns[active]).startswith('auto_'):
+            self.discard_responses.add(active)
+            await self.api_send({'type':'response.cancel','response_id':active})
+            # Let the window finish the cut-off remark now instead of waiting
+            # for its stalled-speech timeout before playing the owner's answer.
+            for item in sorted(self.response_items.get(active, ())):
+                if item not in self.output_complete:
+                    self.output_complete.add(item)
+                    await self.send({'type':'audio_done','item_id':item,'content_index':0})
+
+    async def _send_deferred(self):
+        while self.deferred_requests:
+            request_id = self.deferred_requests.popleft()
+            options, _spontaneous, generation = self.request_options.get(request_id, (None, True, -1))
+            if options is None or generation != self.generation or request_id not in self.pending_responses:
+                continue
+            await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
+            return
 
     def idle_for_spontaneous(self):
-        return bool(self.api) and not self.responding and not self.input_bytes and not self.active_response_id
+        # Not while the owner holds the key, while an answer is being created
+        # (requested but not started yet) or while anything is playing.
+        return (bool(self.api) and not self.responding and not self.input_bytes and not self.active_response_id
+                and not self.ptt_active and not self.pending_responses and not self.pending_commits
+                and not self.deferred_requests
+                and not (self.hub.brain.owner_request_active.is_set()
+                         and time.time() - getattr(self.state, 'turn_started_at', 0.0) < 20))
 
     async def spontaneous(self, note):
         """Miko speaks up on its own (perception, autonomy). The note goes in
@@ -922,6 +969,7 @@ class NativeSession:
             else:
                 await self.ensure_session()
         elif kind == 'start':
+            self.ptt_active = True
             await self.ensure_session()
             if not self.api or self.hub.browser_id:
                 return
@@ -944,6 +992,7 @@ class NativeSession:
             self.input_bytes += len(data)
             await self.api_send({'type':'input_audio_buffer.append','audio':audio})
         elif kind == 'stop' and self.api:
+            self.ptt_active = False
             if self.mode == 'ptt':
                 if self.input_bytes >= 7200:
                     self.pending_commits.append(self.state.turn_id)
@@ -1037,6 +1086,12 @@ class NativeSession:
                 kind = event.get('type','')
                 response_id = event.get('response_id') or event.get('response',{}).get('id','')
                 if response_id in self.discard_responses:
+                    if kind == 'response.done':
+                        if self.active_response_id == response_id:
+                            self.active_response_id = ''
+                            self.responding = False
+                        if self.deferred_requests and not self.active_response_id:
+                            await self._send_deferred()
                     continue
                 if kind == 'response.created':
                     response = event.get('response',{})
@@ -1078,6 +1133,9 @@ class NativeSession:
                         self.automatic_responses.append((self.state.turn_id,self.generation,copy.copy(self.state.tools)))
                 elif kind == 'response.output_audio.delta':
                     item = event['item_id']
+                    self.response_items.setdefault(response_id, set()).add(item)
+                    if len(self.response_items) > 32:
+                        self.response_items.pop(next(iter(self.response_items)))
                     self.output_bytes[item] = self.output_bytes.get(item,0) + len(base64.b64decode(event['delta']))
                     await self.send({'type':'audio','audio':event['delta'],'item_id':item,'content_index':event.get('content_index',0)})
                 elif kind == 'response.output_audio.done':
@@ -1089,6 +1147,8 @@ class NativeSession:
                 elif kind == 'response.done':
                     self.responding = False
                     self.active_response_id = ''
+                    if self.deferred_requests:
+                        await self._send_deferred()
                     response = event.get('response',{})
                     calls = [x for x in response.get('output',[]) if x.get('type') == 'function_call']
                     self.state.model_busy = bool(calls)
@@ -1102,6 +1162,15 @@ class NativeSession:
                 elif kind == 'error':
                     message = str(event.get('error',{}).get('message','Realtime error'))[:500]
                     code = event.get('error',{}).get('code','')
+                    failed = str(event.get('error',{}).get('event_id') or '')
+                    if code == 'conversation_already_has_active_response':
+                        request_id = failed[4:] if failed.startswith('evt_') else ''
+                        if not request_id:
+                            # No event id: assume the newest still-pending request failed.
+                            request_id = next(reversed(self.pending_responses), '') if self.pending_responses else ''
+                        if request_id:
+                            await self._response_rejected(request_id)
+                        continue
                     if code not in ('response_cancel_not_active','input_audio_buffer_commit_empty'):
                         await self.send({'type':'error','message':message,'retryable':True})
         except asyncio.CancelledError:

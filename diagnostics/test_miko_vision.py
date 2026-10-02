@@ -250,6 +250,8 @@ class SpontaneousSpeechTests(unittest.TestCase):
             state_lock = threading.Lock()
             miko = {"realtime_conversation_history": [{"role": "Miko", "text": "ברור. אני כאן, רגוע וזמין.", "at": 1.0}]}
 
+        Brain.owner_request_active = threading.Event()
+
         class Hub:
             brain = Brain()
 
