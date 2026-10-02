@@ -29,6 +29,11 @@ import threading
 import time
 from typing import Any, Callable
 
+try:  # Optional richer perception (MediaPipe): expressions, gestures, gaze.
+    import miko_perception
+except Exception:  # pragma: no cover
+    miko_perception = None
+
 try:  # Optional: the rest of Miko must keep working without OpenCV.
     import cv2
     import numpy as np
@@ -95,7 +100,7 @@ class VisionEngine:
     light_changed, motion. Pure computation, no I/O.
     """
 
-    def __init__(self, model_path: str = YUNET_PATH) -> None:
+    def __init__(self, model_path: str = YUNET_PATH, use_mediapipe: bool = True) -> None:
         if not available():
             raise RuntimeError("OpenCV is not installed")
         self._yunet = None
@@ -114,6 +119,19 @@ class VisionEngine:
         if self._yunet is None:
             self._haar = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
         self.detector = "yunet" if self._yunet is not None else "haar"
+        self.mp = None
+        if use_mediapipe and miko_perception is not None and miko_perception.available():
+            try:
+                self.mp = miko_perception.MediaPipePerception()
+                self.detector = "mediapipe"
+            except Exception as error:
+                print("MIKO VISION: MediaPipe unavailable, using OpenCV:", type(error).__name__)
+        self.face_analyzer = miko_perception.FaceAnalyzer() if self.mp else None
+        self.hand_analyzer = miko_perception.HandAnalyzer() if self.mp else None
+        self.crowd = miko_perception.CrowdAnalyzer() if self.mp else None
+        self.face_obs = None
+        self.people = 0
+        self._cost: deque = deque(maxlen=30)
         self.seen = False
         self.face: _Face | None = None
         self._smooth: _Face | None = None
@@ -194,9 +212,35 @@ class VisionEngine:
             self._bg = None
             return out
 
+        rich: list[dict[str, Any]] = []
+        # Presence and position: the OpenCV detector finds faces at any
+        # distance. MediaPipe adds expressions/gaze/hands when it sees them.
         scale = PROCESS_WIDTH / float(w)
         small = cv2.resize(frame, (PROCESS_WIDTH, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
-        face = self._pick(self._detect(small))
+        detected = self._detect(small)
+        if self.mp is not None:
+            started = time.perf_counter()
+            obs = self.mp.process(frame, now)
+            self._cost.append(time.perf_counter() - started)
+            # Slow machine: look at hands every other frame to keep the pace.
+            if len(self._cost) == self._cost.maxlen:
+                average = sum(self._cost) / len(self._cost)
+                self.mp.hand_every = 2 if average > 0.075 else (1 if average < 0.045 else self.mp.hand_every)
+            if not detected:
+                detected = [_Face(f.cx, f.cy, f.w, f.h, 1.0, abs(f.yaw) < 18) for f in obs.faces]
+            face = self._pick(detected)
+            self.face_obs = None
+            if face is not None and obs.faces:
+                nearest = min(obs.faces, key=lambda f: (f.cx - face.cx) ** 2 + (f.cy - face.cy) ** 2)
+                if abs(nearest.cx - face.cx) < 0.15 and abs(nearest.cy - face.cy) < 0.18:
+                    self.face_obs = nearest
+            if self.face_obs is not None and self.seen:
+                rich += self.face_analyzer.update(self.face_obs, now)
+            rich += self.hand_analyzer.update(obs.hands, now)
+            rich += self.crowd.update(max(len(detected), len(obs.faces)), now)
+            self.people = self.crowd.count
+        else:
+            face = self._pick(detected)
         if (face is not None) != self._had_face:
             self._had_face = face is not None
             self._face_change_at = now
@@ -225,7 +269,7 @@ class VisionEngine:
                 self._smooth = None
                 out.append(self._event(now, "left"))
 
-        if self.seen and self.face is not None:
+        if self.seen and self.face is not None and self.mp is None:
             out.extend(self._attention_step(now))
             self._size_hist.append((now, self.face.w))
             old = [s for t, s in self._size_hist if now - t >= 1.2]
@@ -234,6 +278,14 @@ class VisionEngine:
                 out.append(self._event(now, "approached"))
         out.extend(self._motion_step(gray, now))
         out.extend(self._scene_change_step(gray, now))
+        for event in rich:
+            name = event.pop("event")
+            if name == "wave":
+                if now - self._last_wave < WAVE_COOLDOWN_S or any(e["event"] == "wave" for e in out):
+                    continue
+                self._last_wave = now
+                self._wave.clear()
+            out.append(self._event(now, name, **event))
         return out
 
     # ------------------------------------------------------------ attention
@@ -424,8 +476,13 @@ class VisionEngine:
         if not self.seen or self.face is None:
             return {"type": "vision", "seen": False, "covered": self.covered}
         f = self.face
-        return {"type": "vision", "seen": True, "x": round(-(f.cx * 2 - 1), 3), "y": round(-(f.cy * 2 - 1), 3),
-                "size": round(f.w, 3), "facing": bool(f.frontal)}
+        state = {"type": "vision", "seen": True, "x": round(-(f.cx * 2 - 1), 3), "y": round(-(f.cy * 2 - 1), 3),
+                 "size": round(f.w, 3), "facing": bool(f.frontal)}
+        if self.face_analyzer is not None and self.face_obs is not None:
+            state.update({"expression": self.face_analyzer.expression,
+                          "looking": bool(self.face_analyzer.looking.state),
+                          "roll": round(self.face_obs.roll, 1), "people": self.people})
+        return state
 
     def summary(self, now: float | None = None) -> dict[str, Any]:
         """Model-facing facts (miko_get_vision). No image content."""
@@ -439,8 +496,12 @@ class VisionEngine:
         x = -(f.cx * 2 - 1)
         where = "center" if abs(x) < 0.33 else ("owner's right side" if x > 0 else "owner's left side")
         distance = "close" if f.w > 0.32 else ("far" if f.w < 0.12 else "normal distance")
-        return {"status": "watching", "seen": True, "where": where, "distance": distance,
-                "looking_at_miko": bool(f.frontal), "recent_events": recent}
+        facts = {"status": "watching", "seen": True, "where": where, "distance": distance,
+                 "looking_at_miko": bool(f.frontal), "recent_events": recent}
+        if self.face_analyzer is not None:
+            facts.update({"looking_at_miko": bool(self.face_analyzer.looking.state),
+                          "expression": self.face_analyzer.expression, "people_in_view": self.people})
+        return facts
 
 
 class VisionService:
@@ -634,7 +695,7 @@ class VisionService:
             message = {"type": "vision_event", **event}
             self.emit(message)
             print("MIKO VISION EVENT:", event["event"], flush=True)
-            if self.react and event["event"] in ("wave", "arrived", "covered", "uncovered", "shaken"):
+            if self.react:
                 try:
                     self.react(message)
                 except Exception as error:  # never let a reaction kill the camera loop

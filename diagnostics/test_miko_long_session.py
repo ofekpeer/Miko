@@ -122,6 +122,50 @@ class LongSessionStress(fixture.MikoFixture):
     def test_spontaneous_reaction_right_before_owner_speaks(self):
         asyncio.run(self._scenario(seed=11, reaction_before_start=True))
 
+    def test_lost_request_is_asked_again_then_released(self):
+        async def scenario():
+            hub = RealtimeHub(self.brain)
+            hub.loop = asyncio.get_running_loop()
+            godot = FakeGodot()
+            session = NativeSession(hub, godot)
+            model = FakeRealtimeModel()
+            dropped = []
+            original = model.send
+
+            async def lossy_send(raw):
+                event = json.loads(raw)
+                if event.get("type") == "response.create" and len(dropped) < 1:
+                    dropped.append(event)       # the first request vanishes
+                    return
+                await original(raw)
+            model.send = lossy_send
+            session.api = model
+            session.reader = asyncio.create_task(session.api_events(model))
+            original_watch = session._watch_request
+            session._watch_request = lambda request_id: original_watch(request_id, patience=0.3)
+            await session.client_event({"type": "start"})
+            for _ in range(4):
+                await session.client_event({"type": "audio", "audio": base64.b64encode(b"\1\0" * 1200).decode("ascii")})
+            await session.client_event({"type": "stop"})
+            for _ in range(300):
+                if any(e.get("type") == "response_done" and e.get("status") == "completed" for e in godot.events):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(any(e.get("type") == "response_done" and e.get("status") == "completed" for e in godot.events),
+                            "the re-asked answer never arrived")
+            # A request that never answers at all: released, not stuck.
+            model.send = lambda raw: asyncio.sleep(0)
+            await session.request_response()
+            for _ in range(200):
+                if any(e.get("type") == "status" and e.get("status") == "idle" for e in godot.events):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(any(e.get("type") == "status" and e.get("status") == "idle" for e in godot.events))
+            self.assertFalse(session.pending_responses)
+            await model.close()
+            session.reader.cancel()
+        asyncio.run(scenario())
+
     async def _scenario(self, seed: int, turns: int = 25, reaction_before_start: bool = False):
         rng = random.Random(seed)
         hub = RealtimeHub(self.brain)

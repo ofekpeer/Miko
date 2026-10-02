@@ -18,28 +18,16 @@ sys.path.insert(0, HERE)
 
 
 def ensure_opencv() -> bool:
-    try:
-        import cv2  # noqa: F401
-        print("OK  OpenCV", cv2.__version__)
-        return True
-    except ImportError:
-        pass
-    print("..  OpenCV is missing - installing opencv-python (one time)...")
-    result = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "opencv-python>=4.9", "numpy"])
-    if result.returncode != 0:
-        print("XX  Install failed. Check the internet connection and run this again.")
-        return False
+    import miko_deps
+    sight = miko_deps.ensure_vision_packages()
     importlib.invalidate_caches()
     try:
         import cv2  # noqa: F401
-        print("OK  OpenCV installed", cv2.__version__)
-        return True
     except ImportError:
-        print("XX  OpenCV still cannot be imported by", sys.executable)
+        print("XX  OpenCV cannot be imported by", sys.executable)
         return False
-
-
-CHECK_VERSION = "17.4.5"   # waves, cover, shake, light and motion events
+    print("OK  OpenCV", cv2.__version__, "| MediaPipe:", "yes" if sight == "mediapipe" else "no (basic sight)")
+    return True
 
 
 def main() -> int:
@@ -63,8 +51,9 @@ def main() -> int:
         return 1
     print("OK ", description)
     engine = miko_vision.VisionEngine()
-    print("\nTry: look at the camera, wave beside your face, cover the lens with your hand,")
-    print("shake the laptop gently, switch a light. Press Q to finish.\n")
+    print("OK  perception:", engine.detector)
+    print("\nTry: smile, laugh, nod, shake your head, wink, thumbs up, peace sign, wave,")
+    print("cover the lens, look away and back, yawn. Press Q to finish.\n")
     seen_once = waved = False
     frames = 0
     gui = True               # opencv-python-headless has no preview window
@@ -82,7 +71,14 @@ def main() -> int:
                        "covered": "**  camera covered - Miko can't see", "uncovered": "**  peekaboo - Miko sees again",
                        "shaken": "**  the camera shook - Miko wobbles", "light_changed": "**  the light changed",
                        "motion": "**  something moved", "scene_changed": "**  something in the room changed",
-                       "looked_at_miko": "**  you looked at Miko", "looked_away": "..  you looked away"}.get(name, name))
+                       "looked_at_miko": "**  you looked at Miko", "looked_away": "..  you looked away",
+                       "smiled": "**  you smiled", "laughing": "**  you laughed", "yawned": "**  you yawned",
+                       "surprised": "**  you look surprised", "frowned": "**  you look sad", "winked": "**  you winked",
+                       "eyes_closed": "..  your eyes are closed", "eyes_opened": "..  eyes open again",
+                       "nodded": "**  you nodded yes", "shook_head": "**  you shook your head no",
+                       "tilted_head": "**  you tilted your head", "looked_somewhere": "..  you looked somewhere else",
+                       "someone_joined": "**  someone joined you", "someone_left": "..  someone left"}.get(name, name)
+                      + (f" ({event['gesture']})" if name == "gesture" else ""))
                 seen_once |= name == "arrived"
                 waved |= name == "wave"
             now = time.monotonic()

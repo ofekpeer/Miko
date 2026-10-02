@@ -19,12 +19,12 @@ with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\Curren
 protected=['miko_brain_state.json','miko_credentials.dat','miko_integrations.json',
            'miko_brain_state_before_migration.json','miko_device_settings.json']
 sources=['miko_brain.py','miko_realtime.py','miko_realtime_tools.py','miko_vision.py','miko_voice.html',
-         'check_miko_camera.py','Check Miko Camera.cmd',
+         'check_miko_camera.py','Check Miko Camera.cmd','miko_perception.py','miko_deps.py',
          'start_miko.py','Start Miko.cmd','stop_miko.py','Stop Miko.cmd','requirements_miko.txt']
 excluded={'.godot','.git','__pycache__'}
 for name in sources:
     if not (source/name).is_file():raise RuntimeError('Incomplete update: '+name)
-for name in ['miko-3d/project.godot','device/bridge.py','device/protocol.py','vision_models/face_detection_yunet_2023mar.onnx']:
+for name in ['miko-3d/project.godot','device/bridge.py','device/protocol.py','vision_models/face_detection_yunet_2023mar.onnx','vision_models/face_landmarker.task']:
     if not (source/name).is_file():raise RuntimeError('Incomplete update: '+name)
 for name in protected[:3]:
     if not (target/name).is_file():raise RuntimeError('Existing Miko data missing: '+name)
@@ -128,15 +128,16 @@ exe=launcher.godot_executable()
 if exe and hasattr(launcher,'ensure_imported'):
     print('Preparing the 3D files...')
     launcher.ensure_imported(exe,target/'miko-3d')
-# Sight is optional: OpenCV lets Miko see the owner. A failure here never
-# blocks the update; Miko then simply runs without the camera.
+# Sight is optional: MediaPipe/OpenCV let Miko see the owner. A failure here
+# never blocks the update; Miko then simply runs with less (or no) sight.
 try:
-    import cv2  # noqa: F401
-    print('Camera support already installed.')
-except ImportError:
-    print('Installing camera support (opencv-python)...')
-    pip=subprocess.run([sys.executable,'-m','pip','install','--user','opencv-python>=4.9','numpy'],capture_output=True,text=True)
-    print('Camera support installed.' if pip.returncode==0 else 'Camera support could not be installed now; Miko works without it. Later: py -3.13 -m pip install opencv-python')
+    sys.path.insert(0,str(source))
+    import miko_deps
+    sight=miko_deps.ensure_vision_packages()
+    print({'mediapipe':'Sight: full (expressions, hand gestures, gaze).','opencv':'Sight: basic (faces, waves, changes).',
+           'none':'Sight: off for now (no internet?). Run Check Miko Camera.cmd later.'}[sight])
+except Exception as error:
+    print('Sight packages were not installed:',type(error).__name__)
 print('Miko 17.4 installed. Memory, history, Gmail credentials and device pairing were preserved.')
 print('Backup:',backup)
 print('Open Start Miko.cmd on your Desktop. Hold SPACE in Miko to talk.')

@@ -1,6 +1,9 @@
 flask>=3.1,<4
 openai>=3.19,<4
 websockets>=17,<18
-# Optional: lets Miko see you (local face/wave perception)
-opencv-python>=4.9
+# Optional: lets Miko see you (local, in memory). MediaPipe adds expressions,
+# hand gestures and gaze; it brings opencv-contrib-python (do not also
+# install opencv-python / opencv-python-headless: they share "cv2").
+mediapipe>=1.0
+opencv-contrib-python>=4.9
 numpy>=1.26

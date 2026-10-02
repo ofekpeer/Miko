@@ -125,11 +125,17 @@ history. Old mechanical assistant replies are not examples of your speaking styl
 '''
 
 
-SPONTANEOUS_STYLE = '''Speak up on your own about the latest system note, like a living companion
-reacting in the moment: ONE short spoken Hebrew line, usually 2-8 words, playful
-or warm as fits. React, don't explain. Do not offer help, ask what they want,
-start with 'ברור', describe yourself as available/listening, or mention notes,
-systems or instructions. Never repeat a line you already said.'''
+SESSION_FATAL_ERRORS = {'session_expired', 'invalid_api_key', 'insufficient_quota', 'rate_limit_exceeded',
+                        'model_not_found', 'session_closed'}
+
+SPONTANEOUS_STYLE = '''You just noticed the thing in the latest system note, live, with your own
+eyes. React the way a close friend in the room would, in spoken Hebrew:
+usually 1-6 words, sometimes just a sound ('הא!', 'אוו', 'חחח', 'אוי'),
+sometimes a short warm or playful sentence. Match their energy. Be specific
+to what happened. Vary your words every time - never reuse an opener or a
+line you already said. Don't explain, don't offer help, don't ask what they
+want, don't describe yourself as available or listening, don't mention notes,
+cameras or systems, and don't start with 'ברור'. A question is fine only rarely.'''
 
 
 def _safe_error(error):
@@ -604,43 +610,101 @@ class RealtimeHub:
         self.vision.start()
 
     def vision_reaction(self, event):
-        """Camera thread: the owner waved or came back. The body reacts in
-        Godot from the broadcast event; here Miko may also say a short hello."""
+        """Camera thread: something noteworthy happened. The body reacts in
+        Godot from the broadcast event; here Miko remembers it for the
+        conversation and may also say something short."""
+        self.vision_context(event)
         if self.device_bridge and event.get('event') == 'wave':
             self.broadcast({'type':'action','action':'wave','times':1,'source':'vision'})
         if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._vision_greeting(event), self.loop)
 
+    # What Miko notices, as plain facts. The model decides how (and whether)
+    # a person would react; these are never read out.
     VISION_NOTES = {
-        'wave':'[ראייה] הבעלים מנופף לך לשלום עכשיו מול המצלמה.',
-        'arrived':'[ראייה] הבעלים חזר עכשיו והוא מול המצלמה.',
-        'covered':'[ראייה] מישהו כיסה עכשיו את המצלמה, אתה פתאום לא רואה כלום.',
-        'uncovered':'[ראייה] המצלמה נחשפה שוב, אתה רואה את הבעלים שוב.',
-        'shaken':'[ראייה] הכל רעד עכשיו בחוזקה, כאילו מישהו טלטל אותך.',
+        'wave':'הבעלים מנופף לך לשלום עכשיו.',
+        'arrived':'הבעלים חזר והוא מול המצלמה.',
+        'covered':'מישהו כיסה את המצלמה, פתאום אתה לא רואה כלום.',
+        'uncovered':'המצלמה נחשפה, אתה רואה את הבעלים שוב.',
+        'shaken':'הכל רעד בחוזקה, כאילו טלטלו אותך.',
+        'laughing':'הבעלים צוחק.',
+        'yawned':'הבעלים פיהק.',
+        'winked':'הבעלים קרץ לך.',
+        'frowned':'הבעלים נראה עצוב או מוטרד.',
+        'eyes_closed':'לבעלים עיניים עצומות כבר כמה שניות.',
+        'someone_joined':'מישהו נוסף הצטרף לבעלים מול המצלמה.',
+        'gesture:thumbs_up':'הבעלים עשה לך אגודל למעלה.',
+        'gesture:thumbs_down':'הבעלים עשה לך אגודל למטה.',
+        'gesture:peace':'הבעלים עשה לך סימן וי.',
+        'gesture:love':'הבעלים עשה בידיים את הסימן "אני אוהב אותך".',
+        'gesture:fist':'הבעלים הושיט אגרוף, כמו לכיף.',
     }
     # Seconds between spoken reactions of the same kind, and how often a
-    # reaction is spoken at all (the body always reacts; words only sometimes,
-    # like a person).
-    VISION_COOLDOWN = {'wave':30, 'arrived':60, 'covered':25, 'uncovered':25, 'shaken':25}
-    VISION_TALK_CHANCE = {'wave':0.6, 'arrived':0.8, 'covered':0.6, 'uncovered':0.5, 'shaken':0.75}
+    # reaction is spoken at all: the body always reacts, words only sometimes.
+    VISION_COOLDOWN = {'wave':40, 'arrived':90, 'covered':30, 'uncovered':30, 'shaken':30, 'laughing':45,
+                       'yawned':120, 'winked':40, 'frowned':180, 'eyes_closed':180, 'someone_joined':120,
+                       'gesture:thumbs_up':45, 'gesture:thumbs_down':60, 'gesture:peace':60,
+                       'gesture:love':60, 'gesture:fist':60}
+    VISION_TALK_CHANCE = {'wave':0.55, 'arrived':0.8, 'covered':0.5, 'uncovered':0.45, 'shaken':0.7,
+                          'laughing':0.4, 'yawned':0.45, 'winked':0.5, 'frowned':0.6, 'eyes_closed':0.35,
+                          'someone_joined':0.85, 'gesture:thumbs_up':0.5, 'gesture:thumbs_down':0.6,
+                          'gesture:peace':0.45, 'gesture:love':0.8, 'gesture:fist':0.5}
+    # Short facts added silently to an open conversation, so Miko knows what
+    # it saw when the owner talks to it ("you're smiling", "that thumbs up").
+    CONTEXT_WORDS = {
+        'smiled':'חייך', 'laughing':'צחק', 'yawned':'פיהק', 'surprised':'הופתע', 'frowned':'נראה עצוב',
+        'eyes_closed':'עצם עיניים', 'eyes_opened':'פקח עיניים', 'winked':'קרץ', 'nodded':'הנהן כן',
+        'shook_head':'הניד בראשו לא', 'looked_away':'הסתכל הצידה', 'looked_at_miko':'הסתכל עליך',
+        'someone_joined':'מישהו הצטרף', 'someone_left':'מישהו הלך', 'arrived':'חזר', 'left':'יצא מהתמונה',
+        'wave':'נופף לך', 'covered':'כיסה את המצלמה', 'uncovered':'חשף את המצלמה', 'shaken':'טלטל את המחשב',
+        'gesture:thumbs_up':'עשה אגודל למעלה', 'gesture:thumbs_down':'עשה אגודל למטה', 'gesture:peace':'עשה וי',
+        'gesture:love':'עשה סימן אהבה', 'gesture:fist':'הושיט אגרוף', 'gesture:open_palm':'הרים כף יד',
+        'gesture:pointing':'הצביע', 'scene_changed':'משהו בחדר השתנה', 'light_changed':'האור השתנה',
+    }
+
+    @staticmethod
+    def _vision_kind(event):
+        kind = event.get('event', '')
+        return kind + ':' + str(event.get('gesture', '')) if kind == 'gesture' else kind
+
+    def vision_context(self, event):
+        """Camera thread: remember a perception fact for the conversation."""
+        words = self.CONTEXT_WORDS.get(self._vision_kind(event))
+        if not words:
+            return
+        pending = getattr(self, 'vision_context_pending', None)
+        if pending is None:
+            pending = self.vision_context_pending = deque(maxlen=6)
+        pending.append((time.time(), words))
+
+    async def flush_vision_context(self, native):
+        pending = getattr(self, 'vision_context_pending', None)
+        if not pending or not native.api:
+            return
+        now = time.time()
+        facts = [f'לפני {int(now - t)} שניות: {w}' for t, w in pending if now - t < 120]
+        pending.clear()
+        if facts:
+            await native.api_send({'type':'conversation.item.create','item':{'type':'message','role':'system',
+                'content':[{'type':'input_text','text':'[ראייה, רקע בלבד - לא להגיב על זה ישירות] הבעלים: ' + '; '.join(facts)}]}})
 
     async def _vision_greeting(self, event):
         import random
-        kind = event.get('event')
+        kind = self._vision_kind(event)
         note = self.VISION_NOTES.get(kind)
         now = time.time()
         if not note or self.browser_id:
             return
         spoken = getattr(self, 'vision_event_spoken', {})
         self.vision_event_spoken = spoken
-        # One spoken reaction at a time, with room to breathe in between.
-        if now - self.vision_spoken_at < 8 or now - spoken.get(kind, 0) < self.VISION_COOLDOWN.get(kind, 30):
+        # A social budget: at most one remark every 15 s, and each kind rarely.
+        if now - self.vision_spoken_at < 15 or now - spoken.get(kind, 0) < self.VISION_COOLDOWN.get(kind, 45):
             return
-        chance = getattr(self, 'vision_talk_chance', self.VISION_TALK_CHANCE).get(kind, 0.5)
+        chance = getattr(self, 'vision_talk_chance', self.VISION_TALK_CHANCE).get(kind, 0.4)
         if random.random() > chance:
             spoken[kind] = now                  # stay quiet this time, gesture only
             return
-        if kind in ('arrived', 'wave'):
+        if kind in ('arrived', 'wave', 'laughing', 'winked', 'yawned'):
             with self.brain.state_lock:
                 history = self.brain.miko.get('realtime_conversation_history', [])
                 last_talk = history[-1].get('at', 0) if history and isinstance(history[-1], dict) else 0
@@ -651,8 +715,8 @@ class RealtimeHub:
                 return                      # never talk over the owner or itself
             if not native.api:
                 # Playful reactions may open the voice session (rate limited);
-                # a plain arrival never opens a paid connection by itself.
-                if kind == 'arrived' or now - getattr(self, 'vision_opened_at', 0.0) < 60:
+                # quiet observations never open a paid connection by themselves.
+                if kind in ('arrived', 'frowned', 'eyes_closed', 'yawned') or now - getattr(self, 'vision_opened_at', 0.0) < 60:
                     continue
                 self.vision_opened_at = now
                 await native.ensure_session()
@@ -660,7 +724,7 @@ class RealtimeHub:
                     continue
             self.vision_spoken_at = now
             spoken[kind] = now
-            await native.spontaneous(note)
+            await native.spontaneous('[ראייה] ' + note)
             return
 
     async def handler(self, ws):
@@ -751,6 +815,7 @@ class NativeSession:
         self.deferred_requests = deque()
         self.ptt_active = False
         self.response_items = {}
+        self.tool_rounds = {}
         self.pending_commits = deque()
         self.automatic_responses = deque()
         self.discard_responses = set()
@@ -779,6 +844,33 @@ class NativeSession:
         if len(self.request_options) > 64:
             self.request_options.pop(next(iter(self.request_options)))
         await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
+        if not (origin_turn or '').startswith('auto_'):
+            task = asyncio.create_task(self._watch_request(request_id))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+    async def _watch_request(self, request_id, patience=10.0):
+        """Safety net: an owner's answer that never starts (a lost request or
+        an API hiccup) is asked for once more, then the window is released
+        instead of waiting on 'thinking' forever."""
+        for attempt in range(2):
+            await asyncio.sleep(patience)
+            if request_id not in self.pending_responses or not self.api:
+                return
+            options, _spontaneous, generation = self.request_options.get(request_id, (None, True, -1))
+            if generation != self.generation:
+                self.pending_responses.pop(request_id, None)
+                return
+            if self.active_response_id or request_id in self.deferred_requests:
+                continue                    # it is queued behind a live response
+            if attempt == 0 and options is not None:
+                print('MIKO REALTIME: answer did not start, asking again', flush=True)
+                await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
+        if request_id in self.pending_responses:
+            self.pending_responses.pop(request_id, None)
+            self.hub.brain.owner_request_active.clear()
+            print('MIKO REALTIME: answer never started; releasing the window', flush=True)
+            await self.send({'type':'status','status':'idle','detail':'לא התקבלה תשובה - אפשר לדבר שוב'})
 
     async def _response_rejected(self, request_id):
         """The model refused a response.create because another response was
@@ -829,6 +921,7 @@ class NativeSession:
         with self.hub.brain.state_lock:
             history = self.hub.brain.miko.get('realtime_conversation_history', [])
             recent = [str(h.get('text', ''))[:160] for h in history[-12:] if isinstance(h, dict) and h.get('role') == 'Miko'][-5:]
+        await self.hub.flush_vision_context(self)
         await self.api_send({'type':'conversation.item.create','item':{'type':'message','role':'system',
             'content':[{'type':'input_text','text':note}]}})
         directive = SPONTANEOUS_STYLE
@@ -993,6 +1086,7 @@ class NativeSession:
             await self.api_send({'type':'input_audio_buffer.append','audio':audio})
         elif kind == 'stop' and self.api:
             self.ptt_active = False
+            await self.hub.flush_vision_context(self)
             if self.mode == 'ptt':
                 if self.input_bytes >= 7200:
                     self.pending_commits.append(self.state.turn_id)
@@ -1038,8 +1132,14 @@ class NativeSession:
             if not self.api:
                 return
             await self.api_send({'type':'conversation.item.create','item':{'type':'function_call_output','call_id':call['call_id'],'output':json.dumps(result,ensure_ascii=False)}})
-        if generation == self.generation and not self.responding:
-            await self.request_response()
+        if generation != self.generation:
+            return
+        # Always ask for the follow-up answer: if another response (e.g. Miko's
+        # own remark) is active, the collision handling retries it after.
+        # A model stuck calling tools gets a tools-off answer after 3 rounds.
+        rounds = self.tool_rounds.get(turn_id, 0) + 1
+        self.tool_rounds = {turn_id: rounds}
+        await self.request_response({'tool_choice':'none'} if rounds >= 3 else None)
 
     async def observe_camera(self, call, generation, turn_id):
         call_id = call['call_id']
@@ -1171,8 +1271,13 @@ class NativeSession:
                         if request_id:
                             await self._response_rejected(request_id)
                         continue
-                    if code not in ('response_cancel_not_active','input_audio_buffer_commit_empty'):
+                    # Only session-level failures reset the window. Errors about a
+                    # single request (an item already gone, a late truncate, an
+                    # empty buffer) must not drop the owner's turn in progress.
+                    if code in SESSION_FATAL_ERRORS or event.get('error',{}).get('type') in ('authentication_error', 'server_error'):
                         await self.send({'type':'error','message':message,'retryable':True})
+                    else:
+                        print('MIKO REALTIME API NOTE:', code or 'error', message[:160], flush=True)
         except asyncio.CancelledError:
             pass
         except Exception as error:

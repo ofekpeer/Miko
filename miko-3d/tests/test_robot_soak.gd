@@ -20,15 +20,21 @@ func _initialize() -> void:
 	var rng := RandomNumberGenerator.new()
 	rng.seed = 1234
 	var events := ["wave", "arrived", "left", "approached", "covered", "uncovered", "shaken",
-		"light_changed", "motion", "scene_changed", "looked_at_miko", "looked_away"]
+		"light_changed", "motion", "scene_changed", "looked_at_miko", "looked_away", "smiled", "laughing",
+		"yawned", "surprised", "frowned", "eyes_closed", "eyes_opened", "winked", "nodded", "shook_head",
+		"tilted_head", "looked_somewhere", "gesture", "someone_joined", "someone_left"]
+	var gestures := ["thumbs_up", "thumbs_down", "peace", "open_palm", "pointing", "fist", "love"]
 	var commands := ["walk_left", "walk_right", "come_here", "jump", "wave", "sit", "stand_up", "spin", "stop", "dance"]
 	for frame in 3600:
 		if frame % 45 == 0:
 			robot.on_vision({"type": "vision", "seen": rng.randf() < 0.8, "x": rng.randf_range(-1, 1),
-				"y": rng.randf_range(-0.5, 0.5), "size": rng.randf_range(0.08, 0.4)})
+				"y": rng.randf_range(-0.5, 0.5), "size": rng.randf_range(0.08, 0.4), "roll": rng.randf_range(-20, 20),
+				"expression": ["neutral", "smiling", "laughing", "sad", "surprised", "sleepy"][rng.randi_range(0, 5)],
+				"looking": rng.randf() < 0.7})
 		if rng.randf() < 0.02:
 			robot.on_vision({"type": "vision_event", "event": events[rng.randi_range(0, events.size() - 1)],
-				"x": rng.randf_range(-1, 1)})
+				"x": rng.randf_range(-1, 1), "gesture": gestures[rng.randi_range(0, gestures.size() - 1)],
+				"direction": ["left", "right", "up", "down"][rng.randi_range(0, 3)], "side": "left"})
 		if rng.randf() < 0.004:
 			robot.perform_command(commands[rng.randi_range(0, commands.size() - 1)], rng.randi_range(1, 3))
 		if frame % 300 == 0:
@@ -41,6 +47,7 @@ func _initialize() -> void:
 			_fail("gesture queue grows without bound"); return
 	# Quiet now: everything must settle within a few seconds.
 	robot.manual_state = {}
+	robot.reaction_delay_enabled = false
 	robot.on_vision({"type": "vision_event", "event": "uncovered"})
 	robot._sit_hold = false
 	for frame in 600:

@@ -32,6 +32,7 @@ func _initialize() -> void:
 	await process_frame
 	world.get_node("Presence").setup_stage()
 	robot = world.get_node("MikoScene")
+	robot.reaction_delay_enabled = false
 	await _frames(10)
 
 	# Walk left / right as the owner sees it (screen left = -X).
@@ -147,5 +148,47 @@ func _initialize() -> void:
 	var screen: Vector3 = robot.to_local(robot.get_viewport().get_camera_3d().global_position)
 	if robot._camera_local().distance_to(screen) > 0.01:
 		_fail("unseen owner should fall back to the screen"); return
+	# Human reactions to expressions and hand signs.
+	robot._gesture = ""
+	robot._gesture_queue.clear()
+	robot.on_vision({"type": "vision_event", "event": "gesture", "gesture": "thumbs_up"})
+	if robot._gesture != "thumbs_up":
+		_fail("no thumbs up back"); return
+	await _frames(80)
+	robot._gesture = ""
+	robot.on_vision({"type": "vision_event", "event": "winked"})
+	if robot._wink_left <= 0.0:
+		_fail("no wink back"); return
+	robot.on_vision({"type": "vision_event", "event": "smiled"})
+	if robot._joy_left <= 0.0:
+		_fail("did not smile back"); return
+	robot.on_vision({"type": "vision_event", "event": "frowned"})
+	if robot._concern_left <= 0.0:
+		_fail("no concern for a frown"); return
+	await _frames(60)
+	robot._gesture = ""
+	robot._gesture_queue.clear()
+	robot.on_vision({"type": "vision_event", "event": "gesture", "gesture": "love"})
+	if robot._gesture != "hug":
+		_fail("no hug for I-love-you"); return
+	await _frames(90)
+	# A raised palm stops a walk.
+	robot._pos = Vector2(-1.0, 0.3)
+	robot.perform_command("walk_right")
+	await _frames(15)
+	robot.on_vision({"type": "vision_event", "event": "gesture", "gesture": "open_palm"})
+	await _frames(40)
+	if robot._walking:
+		_fail("open palm did not stop the walk"); return
+	# Reaction delay: with it on, a reaction starts a moment later, not instantly.
+	robot.reaction_delay_enabled = true
+	robot._gesture = ""
+	robot._gesture_queue.clear()
+	robot.on_vision({"type": "vision_event", "event": "laughing"})
+	if robot._gesture != "":
+		_fail("reacted with zero reaction time"); return
+	await _frames(25)
+	if robot._gesture == "" and robot._gesture_queue.is_empty():
+		_fail("delayed reaction never came"); return
 	print("ROBOT_COMMANDS_OK pos=", robot._pos)
 	quit(0)

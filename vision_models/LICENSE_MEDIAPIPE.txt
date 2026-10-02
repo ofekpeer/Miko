@@ -1,0 +1,3 @@
+face_landmarker.task, gesture_recognizer.task
+Source: Google MediaPipe Solutions, https://ai.google.dev/edge/mediapipe/solutions/
+License: Apache License 2.0. Used for local, in-memory face and hand perception only.

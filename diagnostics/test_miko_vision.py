@@ -222,6 +222,32 @@ class GreetingTests(unittest.TestCase):
         self.assertEqual(native.calls + native2.calls, [])
 
 
+class PerceptionContextTests(unittest.TestCase):
+    def test_facts_are_added_silently_before_the_owner_speaks(self):
+        import asyncio
+        import miko_realtime
+        hub = miko_realtime.RealtimeHub.__new__(miko_realtime.RealtimeHub)
+        hub.vision_context({"event": "smiled"})
+        hub.vision_context({"event": "gesture", "gesture": "thumbs_up"})
+        hub.vision_context({"event": "unknown_thing"})
+
+        class Native:
+            api = object()
+            sent = []
+
+            async def api_send(self, event):
+                self.sent.append(event)
+        native = Native()
+        asyncio.run(hub.flush_vision_context(native))
+        self.assertEqual(len(native.sent), 1)
+        text = native.sent[0]["item"]["content"][0]["text"]
+        self.assertEqual(native.sent[0]["item"]["role"], "system")
+        self.assertIn("חייך", text)
+        self.assertIn("אגודל למעלה", text)
+        asyncio.run(hub.flush_vision_context(native))     # nothing new: nothing sent
+        self.assertEqual(len(native.sent), 1)
+
+
 class PlayfulReactionTests(GreetingTests):
     def test_covering_and_shaking_get_spoken_reactions(self):
         import asyncio
@@ -254,6 +280,9 @@ class SpontaneousSpeechTests(unittest.TestCase):
 
         class Hub:
             brain = Brain()
+
+            async def flush_vision_context(self, native):
+                pass
 
         session = miko_realtime.NativeSession(Hub(), ws=None)
         session.api = object()
