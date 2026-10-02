@@ -88,8 +88,17 @@ class VisionEngine:
         self._yunet = None
         self._haar = None
         if os.path.isfile(model_path) and hasattr(cv2, "FaceDetectorYN"):
-            self._yunet = cv2.FaceDetectorYN.create(model_path, "", (PROCESS_WIDTH, 240), 0.72, 0.3, 5)
-        else:
+            # Load from memory: OpenCV cannot open file paths with non-ASCII
+            # characters on Windows (e.g. a Hebrew Desktop folder name).
+            try:
+                with open(model_path, "rb") as handle:
+                    model = np.frombuffer(handle.read(), np.uint8)
+                self._yunet = cv2.FaceDetectorYN.create("onnx", model, np.array([], np.uint8),
+                                                        (PROCESS_WIDTH, 240), 0.72, 0.3, 5)
+            except (cv2.error, OSError, TypeError) as error:
+                print("MIKO VISION: YuNet unavailable, using the built-in face detector:", type(error).__name__)
+                self._yunet = None
+        if self._yunet is None:
             self._haar = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
         self.detector = "yunet" if self._yunet is not None else "haar"
         self.seen = False
