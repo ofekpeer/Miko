@@ -39,7 +39,7 @@ def ensure_opencv() -> bool:
         return False
 
 
-CHECK_VERSION = "17.4.4"   # waves, cover, shake, light and motion events
+CHECK_VERSION = "17.4.5"   # waves, cover, shake, light and motion events
 
 
 def main() -> int:
@@ -81,7 +81,8 @@ def main() -> int:
                        "wave": "**  you waved - Miko waves back", "approached": "**  you came closer",
                        "covered": "**  camera covered - Miko can't see", "uncovered": "**  peekaboo - Miko sees again",
                        "shaken": "**  the camera shook - Miko wobbles", "light_changed": "**  the light changed",
-                       "motion": "**  something moved"}.get(name, name))
+                       "motion": "**  something moved", "scene_changed": "**  something in the room changed",
+                       "looked_at_miko": "**  you looked at Miko", "looked_away": "..  you looked away"}.get(name, name))
                 seen_once |= name == "arrived"
                 waved |= name == "wave"
             now = time.monotonic()

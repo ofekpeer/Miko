@@ -105,6 +105,9 @@ var _vision_last_seen := -1e9
 var _surprise_left := 0.0
 var _blind := false                    # camera covered: Miko "can't see"
 var _dizzy_left := 0.0
+var _joy_left := 0.0
+var _plop_left := 0.0
+var _last_variant: Dictionary = {}
 
 var _gesture := ""
 var _gesture_t := 0.0
@@ -316,82 +319,139 @@ func on_vision(event: Dictionary) -> void:
 					+ basis.z * (distance - 1.0)
 				_vision_point = to_local(head)
 		return
-	match str(event.get("event", "")):
+	var kind := str(event.get("event", ""))
+	var busy := _command != "" and _command not in ["sit", "look_around"]
+	match kind:
 		"wave":
-			# Wave back, the way a person would: turn to them, smile, wave.
-			if _command != "" and _command not in ["sit", "look_around"]:
+			# Wave back the way a person would, a little differently each time.
+			if busy:
 				return
-			if _asleep or _sleep_walk:
-				_asleep = false
-				_sleep_walk = false
-			if not _sit_hold:
-				_sit_goal = 0.0
-			_walking = false
-			_look_user = true
-			_face_yaw_goal = _yaw_toward(_camera_local())
-			_queue_gesture("wave", 2.3, 1.0, true)
-			_behavior = "linger"
-			_behavior_left = _rng.randf_range(4.0, 7.0)
+			_attend_owner()
+			_joy_left = 2.5
+			match _variant(kind, 4):
+				0:
+					_queue_gesture("wave", 2.3, 1.0, true)
+				1:
+					_queue_gesture("wave", 2.0, -1.0, true)
+					_gesture_queue.append(["tilt", 1.2])
+				2:
+					_queue_gesture("hop", 1.0, 0.0, true)
+					_gesture_queue.append(["wave", 2.0])
+				_:
+					_queue_gesture("nod", 0.9, 0.0, true)
+					_gesture_queue.append(["wave", 1.8])
 		"arrived":
 			var away := _clock - _vision_last_seen
 			if _asleep:
-				_asleep = false
-				_sit_goal = 0.0
+				_wake_for_reaction()
 				_queue_gesture("stretch", 3.2, 0.0, true)
-			elif _command == "":
-				_look_user = true
-				_face_yaw_goal = _yaw_toward(_camera_local())
-				_queue_gesture("wave" if away > 60.0 else "tilt", 2.3 if away > 60.0 else 1.4, 1.0, away > 60.0)
-				_behavior = "linger"
-				_behavior_left = _rng.randf_range(3.0, 5.0)
+			elif not busy:
+				_attend_owner()
+				if away > 60.0:
+					_joy_left = 2.0
+					_queue_gesture(["wave", "hop", "wave"][_variant(kind, 3)], 2.2, 1.0, true)
+				else:
+					_queue_gesture(["tilt", "nod"][_variant(kind, 2)], 1.3, 0.0, true)
 		"left":
-			if _command == "" and not _asleep:
+			if not busy and not _asleep:
 				_queue_gesture("glance", 2.0)
 		"approached":
 			_surprise_left = 1.6
-			if _command == "" and _gesture == "":
-				_queue_gesture("tilt", 1.3)
+			if not busy and _gesture == "":
+				_queue_gesture(["tilt", "shake_head", "nod"][_variant(kind, 3)], 1.3)
+		"looked_at_miko":
+			# Caught your eye: a small, warm acknowledgement.
+			if not busy and _gesture == "" and not _asleep:
+				_look_user = true
+				_joy_left = 1.8
+				_queue_gesture(["nod", "tilt", "hop"][_variant(kind, 3)], 1.0)
+		"looked_away":
+			if not busy and _gesture == "" and not _asleep:
+				_queue_gesture("glance", 2.0)
 		"covered":
-			# Someone put a hand over its eyes: startled, then peers at the lens.
+			# Someone put a hand over its eyes.
 			_blind = true
 			_surprise_left = 1.8
 			_wake_for_reaction()
 			_walking = false
-			_look_user = true
-			_face_yaw_goal = _yaw_toward(_camera_local())
-			_queue_gesture("peer", 2.6, 0.0, true)
+			_attend_owner()
+			match _variant(kind, 3):
+				0:
+					_queue_gesture("peer", 2.6, 0.0, true)
+				1:
+					_queue_gesture("cover_eyes", 2.4, 0.0, true)
+				_:
+					_queue_gesture("glance", 1.6, 0.0, true)
+					_gesture_queue.append(["shake_head", 1.1])
 		"uncovered":
 			# Peekaboo: there you are!
 			_blind = false
 			_wake_for_reaction()
-			_look_user = true
-			_face_yaw_goal = _yaw_toward(_camera_local())
-			_queue_gesture("hop", 1.1, 0.0, true)
-			_gesture_queue.append(["laugh", 1.6])
+			_attend_owner()
+			_joy_left = 2.2
+			match _variant(kind, 3):
+				0:
+					_queue_gesture("hop", 1.1, 0.0, true)
+					_gesture_queue.append(["laugh", 1.6])
+				1:
+					_queue_gesture("laugh", 1.8, 0.0, true)
+				_:
+					_queue_gesture("tilt", 1.0, 0.0, true)
+					_gesture_queue.append(["wave", 1.8])
 		"shaken":
-			# The world shook: loses balance, wobbles, shakes it off.
+			# The world shook: loses balance, wobbles, then copes its own way.
 			_wake_for_reaction()
 			_walking = false
 			_surprise_left = 1.2
 			_dizzy_left = 3.2
 			_queue_gesture("wobble", 2.2, 0.0, true)
-			_gesture_queue.append(["shake_head", 1.1])
+			match _variant(kind, 3):
+				0:
+					_gesture_queue.append(["shake_head", 1.1])
+				1:
+					_plop_left = 2.6                # sits down hard, then gets up
+					_sit_goal = 1.0
+				_:
+					_gesture_queue.append(["laugh", 1.5])
 		"light_changed":
-			if _command == "":
+			if not busy:
 				_surprise_left = 1.0
 				_look_point = to_local(global_position) + Vector3(_rng.randf_range(-1.0, 1.0), 2.2, -1.5)
 				_look_user = false
 				_look_wait = 2.5
 				_queue_gesture("glance", 2.0)
-		"motion":
-			if _command == "" and not _asleep and _gesture == "":
-				# Something moved over there: look that way for a moment.
+		"motion", "scene_changed":
+			if not busy and not _asleep and _gesture == "":
+				# Something moved or changed over there: look that way.
 				var side := clampf(float(event.get("x", 0.0)), -1.0, 1.0)
-				var camera_point := _camera_local()
-				_look_point = camera_point + Vector3(side * 1.6, -0.2, 0.0)
+				_look_point = _camera_local() + Vector3(side * 1.6, -0.3, 0.0)
 				_look_user = false
-				_look_wait = 2.2
-				_surprise_left = 0.6
+				_look_wait = 3.0 if kind == "scene_changed" else 2.2
+				_surprise_left = 0.8 if kind == "scene_changed" else 0.5
+				if kind == "scene_changed":
+					_queue_gesture("tilt", 1.4)
+
+
+func _attend_owner() -> void:
+	_wake_for_reaction()
+	if not _sit_hold:
+		_sit_goal = 0.0
+	_walking = false
+	_look_user = true
+	_face_yaw_goal = _yaw_toward(_camera_local())
+	_behavior = "linger"
+	_behavior_left = _rng.randf_range(4.0, 7.0)
+
+
+## Pick one of `count` reaction variants, never the same as last time for
+## this event, so repeated events don't get a canned, identical response.
+func _variant(kind: String, count: int) -> int:
+	var last: int = _last_variant.get(kind, -1)
+	var pick := _rng.randi_range(0, count - 1)
+	if pick == last and count > 1:
+		pick = (pick + 1 + _rng.randi_range(0, count - 2)) % count
+	_last_variant[kind] = pick
+	return pick
 
 
 func _yaw_toward(point: Vector3) -> float:
@@ -716,6 +776,10 @@ func _release_sit() -> void:
 
 
 func _update_command(delta: float) -> void:
+	if _plop_left > 0.0:
+		_plop_left -= delta
+		if _plop_left <= 0.0 and not _sit_hold:
+			_sit_goal = 0.0
 	if _sit_hold:
 		_sit_hold_left -= delta
 		if _sit_hold_left <= 0.0:
@@ -924,6 +988,15 @@ func _gesture_pose(q: Dictionary, root: Array) -> Dictionary:
 				override["forearm." + side_name] = e
 				_add(q, "upperarm." + side_name, Quaternion(RIGHT, -0.40 * e) * Quaternion(FORWARD, k * 0.15 * e))
 				_add(q, "forearm." + side_name, Quaternion(RIGHT, -0.70 * e))
+		"cover_eyes":
+			# Hands up over the visor: "I can't see!"
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["upperarm." + side_name] = e
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(RIGHT, -1.15 * e) * Quaternion(FORWARD, k * 0.35 * e))
+				_add(q, "forearm." + side_name, Quaternion(RIGHT, -1.05 * e) * Quaternion(FORWARD, -k * 0.55 * e))
+			_add(q, "head", Quaternion(FORWARD, 0.12 * sin(t * TAU * 1.2) * e) * Quaternion(RIGHT, 0.08 * e))
 		"wobble":
 			# Off balance: decaying sway, arms out to steady itself.
 			var decay := 1.0 - _ease(t, 0.15, 1.0)
@@ -1109,6 +1182,10 @@ func _update_face(delta: float, state: Dictionary) -> void:
 	if state["listening"]:
 		goal["size"] = maxf(goal["size"], 1.05)
 	_dizzy_left = maxf(0.0, _dizzy_left - delta)
+	_joy_left = maxf(0.0, _joy_left - delta)
+	if _joy_left > 0.0:
+		goal["smile"] = maxf(goal["smile"], 0.85)
+		goal["happy"] = maxf(goal["happy"], 0.55 * clampf(_joy_left, 0.0, 1.0))
 	if _blind:
 		goal["open_base"] = minf(goal["open_base"], 0.55)   # squinting at the dark
 		goal["sad"] = maxf(goal["sad"], 0.3)

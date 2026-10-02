@@ -70,6 +70,10 @@ var _playback: AudioStreamGeneratorPlayback
 var _pending_frames := PackedVector2Array()
 var _queued_audio_items: Array[Dictionary] = []
 var _speaker_active := false
+## Safety net: speech whose completion marker never arrives (a cancelled or
+## failed response) must not leave Miko "speaking" forever.
+const STALLED_SPEECH_MS := 4000
+var _last_audio_msec := 0
 var _remote_audio_done := false
 var _current_item_id := ""
 var _current_content_index := 0
@@ -100,6 +104,7 @@ func _process(_delta: float) -> void:
 	_feed_playback()
 	_report_playback(false)
 	_maybe_finish_playback()
+	_release_stalled_speech(Time.get_ticks_msec())
 
 
 func configure(new_mode: String) -> void:
@@ -613,7 +618,23 @@ func _clear_capture() -> void:
 	_has_source_sample = false
 
 
+func _release_stalled_speech(now: int) -> void:
+	if not _speaker_active or external_voice_active or now - _last_audio_msec < STALLED_SPEECH_MS:
+		return
+	if not _pending_frames.is_empty():
+		return
+	if _playback != null and _playback.get_frames_available() < _generator_capacity:
+		return                          # still draining what was received
+	if not _current_item_id.is_empty():
+		_remote_audio_done = true
+		_maybe_finish_playback()
+	if _speaker_active:
+		_clear_playback()
+		status_changed.emit("ready", "Listening")
+
+
 func _receive_audio(event: Dictionary) -> void:
+	_last_audio_msec = Time.get_ticks_msec()
 	var item_id := str(event.get("item_id", ""))
 	var content_index := int(event.get("content_index", 0))
 	var bytes := Marshalls.base64_to_raw(str(event.get("audio", "")))

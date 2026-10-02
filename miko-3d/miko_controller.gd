@@ -5329,6 +5329,19 @@ func _on_realtime_transcript(role: String, text: String, turn_id: String, turn_n
 	var clean := text.strip_edges()
 	if clean.is_empty() or role not in ["user", "assistant"]:
 		return
+	if turn_id.is_empty() and role == "assistant" and not item_id.is_empty():
+		# A reply without an owner turn: keep every caption update of the same
+		# item in one place instead of opening a new row per update.
+		for existing_index in range(realtime_transcript_turns.size()):
+			var existing: Dictionary = realtime_transcript_turns[existing_index]
+			if existing.get("session_id") == (session_id if not session_id.is_empty() else "unknown") \
+					and (existing.get("assistant_items", []) as Array).has(item_id):
+				turn_id = str(existing.get("turn_id", ""))
+				break
+		if turn_id.is_empty():
+			turn_id = "auto_" + item_id
+	if turn_id.begins_with("auto_"):
+		turn_number = -1                # spoken up on its own: append in time order
 	var index := _ensure_realtime_turn(turn_id, turn_number, session_id)
 	var slot: Dictionary = realtime_transcript_turns[index]
 	if role == "user":
@@ -5363,9 +5376,11 @@ func _refresh_realtime_transcript() -> void:
 	for index in range(realtime_transcript_turns.size()):
 		var slot: Dictionary = realtime_transcript_turns[index]
 		var user_text := str(slot.get("user", ""))
-		var user_line := "אתה: " + (user_text if not user_text.is_empty() else "מתמלל…")
-		lines.append(user_line)
-		character_offset += user_line.length() + 1
+		# Miko spoke up on its own (perception/autonomy): no owner line.
+		if not str(slot.get("turn_id", "")).begins_with("auto_") or not user_text.is_empty():
+			var user_line := "אתה: " + (user_text if not user_text.is_empty() else "מתמלל…")
+			lines.append(user_line)
+			character_offset += user_line.length() + 1
 		var answers: Array = slot.get("assistant", [])
 		var item_ids: Array = slot.get("assistant_items", [])
 		for answer_index in range(answers.size()):

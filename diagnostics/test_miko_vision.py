@@ -70,6 +70,29 @@ class VisionTests(unittest.TestCase):
         events = run(engine, waving, start=1.0)
         self.assertEqual(events.count("wave"), 1, events)
 
+    def test_big_hand_close_to_the_camera_is_a_wave_not_a_shake(self):
+        engine = miko_vision.VisionEngine()
+        run(engine, [frame()] * 4)
+        big = cv2.resize(HAND, (200, 260))
+        frames = []
+        for i in range(26):
+            img = frame()
+            x = int(380 + 60 * math.sin(i * 2 * math.pi / 5.0))
+            img[60:320, x:x + 200] = big
+            frames.append(img)
+        events = run(engine, frames, start=1.0)
+        self.assertIn("wave", events)
+        self.assertNotIn("shaken", events)
+
+    def test_something_new_in_the_room_is_noticed(self):
+        engine = miko_vision.VisionEngine()
+        run(engine, [frame()] * 30)
+        with_box = frame()
+        with_box[330:450, 40:170] = (30, 160, 220)       # a box put on the desk
+        events = run(engine, [with_box] * 30, start=3.0)
+        self.assertIn("scene_changed", events)
+        self.assertEqual(events.count("scene_changed"), 1)
+
     def test_still_hand_and_vertical_motion_are_not_waves(self):
         engine = miko_vision.VisionEngine()
         run(engine, [frame()] * 4)
@@ -164,14 +187,16 @@ class GreetingTests(unittest.TestCase):
             def __init__(self):
                 self.api, self.responding, self.input_bytes, self.calls = object(), False, 0, []
 
-            async def request_response(self, response=None):
-                self.calls.append(response)
+            async def spontaneous(self, note):
+                self.calls.append(note)
+                return True
 
             async def ensure_session(self):
                 self.api = object()
 
         hub = miko_realtime.RealtimeHub.__new__(miko_realtime.RealtimeHub)
         hub.browser_id, hub.vision_spoken_at, hub.brain = None, 0.0, Brain()
+        hub.vision_talk_chance = {k: 1.0 for k in miko_realtime.RealtimeHub.VISION_TALK_CHANCE}
         native = Native()
         hub.native = {native}
         return hub, native
@@ -182,8 +207,7 @@ class GreetingTests(unittest.TestCase):
         asyncio.run(hub._vision_greeting({"event": "wave"}))
         asyncio.run(hub._vision_greeting({"event": "wave"}))     # cooldown
         self.assertEqual(len(native.calls), 1)
-        self.assertEqual(native.calls[0]["tool_choice"], "none")
-        self.assertIn("מנופף", native.calls[0]["instructions"])
+        self.assertIn("מנופף", native.calls[0])
 
     def test_no_greeting_while_busy_closed_or_mid_conversation(self):
         import asyncio
@@ -206,8 +230,8 @@ class PlayfulReactionTests(GreetingTests):
         hub.vision_spoken_at = 0.0
         asyncio.run(hub._vision_greeting({"event": "shaken"}))
         self.assertEqual(len(native.calls), 2)
-        self.assertIn("כיסה", native.calls[0]["instructions"])
-        self.assertIn("רעדו", native.calls[1]["instructions"])
+        self.assertIn("כיסה", native.calls[0])
+        self.assertIn("רעד", native.calls[1])
 
     def test_closed_session_opens_once_for_a_wave(self):
         import asyncio
@@ -215,6 +239,50 @@ class PlayfulReactionTests(GreetingTests):
         native.api = None
         asyncio.run(hub._vision_greeting({"event": "wave"}))
         self.assertEqual(len(native.calls), 1)          # opened, then spoke
+
+
+class SpontaneousSpeechTests(unittest.TestCase):
+    def _session(self):
+        import threading
+        import miko_realtime
+
+        class Brain:
+            state_lock = threading.Lock()
+            miko = {"realtime_conversation_history": [{"role": "Miko", "text": "ברור. אני כאן, רגוע וזמין.", "at": 1.0}]}
+
+        class Hub:
+            brain = Brain()
+
+        session = miko_realtime.NativeSession(Hub(), ws=None)
+        session.api = object()
+        sent = []
+
+        async def api_send(event):
+            sent.append(event)
+        session.api_send = api_send
+        return session, sent
+
+    def test_note_is_a_system_item_and_reply_has_its_own_auto_turn(self):
+        import asyncio
+        session, sent = self._session()
+        session.state.turn_id = "turn_owner"
+        self.assertTrue(asyncio.run(session.spontaneous("[ראייה] נופפו לך")))
+        self.assertEqual(sent[0]["item"]["role"], "system")
+        self.assertEqual(sent[1]["type"], "response.create")
+        self.assertEqual(sent[1]["response"]["tool_choice"], "none")
+        self.assertIn("רגוע וזמין", sent[1]["response"]["instructions"])   # told not to repeat it
+        origin = next(iter(session.pending_responses.values()))[0]
+        self.assertTrue(origin.startswith("auto_"))
+        self.assertEqual(session.state.turn_id, "turn_owner")           # owner turn untouched
+
+    def test_never_speaks_over_a_response_or_the_owner(self):
+        import asyncio
+        session, sent = self._session()
+        session.responding = True
+        self.assertFalse(asyncio.run(session.spontaneous("x")))
+        session.responding, session.input_bytes = False, 4800
+        self.assertFalse(asyncio.run(session.spontaneous("x")))
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

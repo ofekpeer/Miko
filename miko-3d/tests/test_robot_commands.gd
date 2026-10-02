@@ -11,6 +11,15 @@ func _fail(message: String) -> void:
 	quit(1)
 
 
+func _waves(r: Node) -> bool:
+	if r._gesture == "wave":
+		return true
+	for item in r._gesture_queue:
+		if item[0] == "wave":
+			return true
+	return false
+
+
 func _frames(count: int) -> void:
 	for i in count:
 		await process_frame
@@ -45,14 +54,14 @@ func _initialize() -> void:
 		_fail("come_here did not approach: " + str(robot._pos)); return
 
 	# Step back while still facing the owner.
-	var yaw_before: float = robot._yaw
 	var y_before: float = robot._pos.y
 	robot.perform_command("walk_back")
 	await _frames(150)
 	if robot._pos.y > y_before - 0.3:
 		_fail("walk_back did not step back: " + str(robot._pos)); return
-	if absf(wrapf(robot._yaw - yaw_before, -PI, PI)) > 0.6:
-		_fail("walk_back turned away instead of backing up"); return
+	var facing_owner: float = robot._yaw_toward(robot._camera_local())
+	if absf(wrapf(robot._yaw - facing_owner, -PI, PI)) > 0.6:
+		_fail("walk_back turned away instead of backing up while facing the owner"); return
 
 	# Jump three times: three hops, one after another.
 	robot.perform_command("jump", 3)
@@ -102,9 +111,17 @@ func _initialize() -> void:
 	robot._gesture = ""
 	robot.on_vision({"type": "vision_event", "event": "wave", "hand": "right"})
 	await _frames(2)
-	if robot._gesture != "wave":
+	if not _waves(robot):
 		_fail("did not wave back"); return
-	await _frames(90)
+	await _frames(150)
+	# Waved again: still waves back, but not the identical routine.
+	var first_variant: int = robot._last_variant["wave"]
+	robot._gesture = ""
+	robot._gesture_queue.clear()
+	robot.on_vision({"type": "vision_event", "event": "wave"})
+	if not _waves(robot) or robot._last_variant["wave"] == first_variant:
+		_fail("second wave got no reply or the same routine"); return
+	await _frames(150)
 	# Coming back wakes a sleeping Miko.
 	robot._asleep = true
 	robot.on_vision({"type": "vision_event", "event": "arrived"})
@@ -113,11 +130,11 @@ func _initialize() -> void:
 	# Covering the camera: startled peer; uncovering: peekaboo hop.
 	robot._command = ""
 	robot.on_vision({"type": "vision_event", "event": "covered"})
-	if not robot._blind or robot._gesture != "peer":
+	if not robot._blind or robot._gesture not in ["peer", "cover_eyes", "glance"]:
 		_fail("covering the camera got no reaction"); return
 	await _frames(90)
 	robot.on_vision({"type": "vision_event", "event": "uncovered"})
-	if robot._blind or robot._gesture != "hop":
+	if robot._blind or robot._gesture not in ["hop", "laugh", "tilt"]:
 		_fail("uncovering the camera got no peekaboo"); return
 	await _frames(120)
 	# Shaking the computer: wobble, then shake it off.

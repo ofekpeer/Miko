@@ -133,6 +133,14 @@ class VisionEngine:
         self._last_light = -1e9
         self._face_change_at = -1e9
         self._hann = None
+        self._bg = None
+        self._scene_since: float | None = None
+        self._last_scene = -1e9
+        self._quiet = True
+        self._frontal_since: float | None = None
+        self._away_since: float | None = None
+        self._looking = None              # None unknown, True at Miko, False away
+        self._last_attention = -1e9
         self._jolts: deque = deque(maxlen=20)
         self._had_face = False
         self.covered = False
@@ -183,6 +191,7 @@ class VisionEngine:
             # A hand over the lens is not the owner leaving.
             self._last_face_at = now if self.seen else self._last_face_at
             self._prev_gray = None
+            self._bg = None
             return out
 
         scale = PROCESS_WIDTH / float(w)
@@ -217,12 +226,77 @@ class VisionEngine:
                 out.append(self._event(now, "left"))
 
         if self.seen and self.face is not None:
+            out.extend(self._attention_step(now))
             self._size_hist.append((now, self.face.w))
             old = [s for t, s in self._size_hist if now - t >= 1.2]
             if old and self.face.w > old[-1] * 1.45 and now - self._last_approach > 6.0:
                 self._last_approach = now
                 out.append(self._event(now, "approached"))
         out.extend(self._motion_step(gray, now))
+        out.extend(self._scene_change_step(gray, now))
+        return out
+
+    # ------------------------------------------------------------ attention
+    def _attention_step(self, now: float) -> list[dict[str, Any]]:
+        """The owner starts looking at Miko, or looks away for a while."""
+        frontal = bool(self.face.frontal)
+        if frontal:
+            self._away_since = None
+            self._frontal_since = self._frontal_since if self._frontal_since is not None else now
+        else:
+            self._frontal_since = None
+            self._away_since = self._away_since if self._away_since is not None else now
+        out = []
+        if now - self._last_attention < 6.0:
+            return out
+        if frontal and self._looking is False and now - self._frontal_since >= 0.8:
+            self._looking = True
+            self._last_attention = now
+            out.append(self._event(now, "looked_at_miko"))
+        elif not frontal and self._looking is not False and self._away_since is not None and now - self._away_since >= 2.5:
+            first = self._looking is None
+            self._looking = False
+            if not first:
+                self._last_attention = now
+                out.append(self._event(now, "looked_away"))
+        elif frontal and self._looking is None and now - self._frontal_since >= 0.8:
+            self._looking = True
+        return out
+
+    # ------------------------------------------------------------ scene change
+    def _scene_change_step(self, gray, now: float) -> list[dict[str, Any]]:
+        """Something in the room changed and stayed changed (an object put
+        down or taken away, a chair moved, a door opened)."""
+        g = gray.astype(np.float32)
+        if self._bg is None or self._bg.shape != g.shape or now - self._last_light < 3.0:
+            self._bg = g
+            self._scene_since = None
+            return []
+        mask = np.abs(g - self._bg) > 28
+        H, W = mask.shape
+        if self.face is not None and self.seen:
+            # The owner's own head and body are not "the room".
+            f = self.face
+            x0, x1 = int((f.cx - 1.8 * f.w) * W), int((f.cx + 1.8 * f.w) * W)
+            y0 = int((f.cy - 1.2 * f.h) * H)
+            mask[max(0, y0):, max(0, x0):max(0, x1)] = False
+        area = float(mask.mean())
+        out = []
+        if area > 0.03 and self._quiet:
+            self._scene_since = self._scene_since if self._scene_since is not None else now
+            if now - self._scene_since >= 1.0:
+                if now - self._last_scene > 10.0:
+                    self._last_scene = now
+                    ys, xs = np.nonzero(mask)
+                    cx = float(xs.mean()) / W if len(xs) else 0.5
+                    out.append(self._event(now, "scene_changed", x=round(-(cx * 2 - 1), 2)))
+                self._bg = g                     # the new arrangement is normal now
+                self._scene_since = None
+        else:
+            if area <= 0.03:
+                self._scene_since = None
+            if self._quiet:
+                cv2.accumulateWeighted(g, self._bg, 0.03)
         return out
 
     def _event(self, now: float, name: str, **detail: Any) -> dict[str, Any]:
@@ -277,9 +351,17 @@ class VisionEngine:
         if self._hann is None or self._hann.shape != gray.shape:
             self._hann = cv2.createHanningWindow((W, H), cv2.CV_32F)
         (sx, sy), response = cv2.phaseCorrelate(prev.astype(np.float32), gray.astype(np.float32), self._hann)
-        changed = float(np.mean(cv2.absdiff(prev, gray) > 22))
         shift = math.hypot(sx, sy)
-        global_move = (response > 0.08 and shift > 1.2) or changed > 0.55
+        global_move = False
+        if response > 0.08 and shift > 1.2:
+            # Does shifting the whole previous frame explain the new one? It
+            # does when the camera moved; it does not when only a hand moved
+            # over a still room (shifting the room then makes things worse).
+            m = max(2, int(math.ceil(shift)) + 2)
+            moved = cv2.warpAffine(prev, np.float32([[1, 0, sx], [0, 1, sy]]), (W, H), borderMode=cv2.BORDER_REPLICATE)
+            raw = float(cv2.absdiff(prev, gray)[m:-m, m:-m].mean())
+            aligned = float(cv2.absdiff(moved, gray)[m:-m, m:-m].mean())
+            global_move = raw > 2.0 and aligned < 0.6 * raw
         if global_move:
             axis = sx if abs(sx) >= abs(sy) else sy
             self._shake.add(now, axis if shift > 1.2 else 0.0)
@@ -291,6 +373,7 @@ class VisionEngine:
                 self._jolts.clear()
                 self._wave.clear()
                 out.append(self._event(now, "shaken"))
+            self._quiet = False
             return out                          # local motion is meaningless now
         self._shake.add(now, 0.0)
         flow = cv2.calcOpticalFlowFarneback(prev, gray, None, 0.5, 2, 11, 2, 5, 1.1, 0)
@@ -309,6 +392,7 @@ class VisionEngine:
             y0, y1 = int((f.cy - 0.8 * f.h) * H), int((f.cy + 0.9 * f.h) * H)
             moving[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = False
         area = float(moving.mean())
+        self._quiet = area < 0.02
         if area < 0.006:
             self._wave.add(now, 0.0)
             return out
@@ -317,7 +401,7 @@ class VisionEngine:
         ys, xs = np.nonzero(moving)
         cx = float(xs.mean()) / W
         # A hand: a modest area moving mostly sideways, back and forth.
-        if 0.006 <= area <= 0.35 and abs(vx) > 0.9 * vy:
+        if 0.006 <= area <= 0.65 and abs(vx) > 0.9 * vy:
             self._wave.add(now, vx)
         else:
             self._wave.add(now, 0.0)
@@ -549,7 +633,7 @@ class VisionService:
         for event in events:
             message = {"type": "vision_event", **event}
             self.emit(message)
-            print("MIKO VISION EVENT:", event["event"])
+            print("MIKO VISION EVENT:", event["event"], flush=True)
             if self.react and event["event"] in ("wave", "arrived", "covered", "uncovered", "shaken"):
                 try:
                     self.react(message)
