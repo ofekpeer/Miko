@@ -61,6 +61,7 @@ def main() -> None:
     pair.add_argument("--secret-file", required=True, type=Path, help="private file to provision into device NVS")
     pair.add_argument("--replace", action="store_true", help="revoke an existing pairing for this owner")
     pair.add_argument("--camera", action="store_true", help="allow explicit, locally confirmed camera snapshots")
+    pair.add_argument("--vision", action="store_true", help="allow low-res perception frames (presence, waves), analysed in memory on this computer")
 
     enable = commands.add_parser("enable", help="enable TLS on one private LAN IP")
     enable.add_argument("--bind-host", required=True, help="numeric private LAN IP, never 0.0.0.0")
@@ -83,7 +84,7 @@ def main() -> None:
         if secret_file.exists():
             parser.error("secret-file already exists; choose a new private path")
         secret = create_pairing_secret()
-        capabilities = ["audio", "display", "gesture"] + (["camera"] if args.camera else [])
+        capabilities = ["audio", "display", "gesture"] + (["camera"] if args.camera else []) + (["vision"] if args.vision else [])
         data["paired_devices"] = [{
             "device_id": args.device_id,
             "pairing_secret_b64": secret,

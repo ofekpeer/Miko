@@ -89,6 +89,21 @@ var _asleep := false
 var _sleep_walk := false
 var _sleep_left := 0.0
 
+# Owner commands ("תלך שמאלה", "תקפוץ", "שב") take priority over autonomy.
+var _command := ""
+var _command_left := 0.0
+var _gesture_queue: Array = []
+var _sit_hold := false
+var _sit_hold_left := 0.0
+var _backward := false
+
+# What the camera reports about the owner (host-side perception).
+var _vision_seen := false
+var _vision_fresh_until := -1.0
+var _vision_point := Vector3.ZERO      # owner's head, MikoScene local space
+var _vision_last_seen := -1e9
+var _surprise_left := 0.0
+
 var _gesture := ""
 var _gesture_t := 0.0
 var _gesture_len := 1.0
@@ -213,6 +228,7 @@ func _process(delta: float) -> void:
 	var state := _read_state()
 	_update_engagement(delta, state)
 	_update_cues(state)
+	_update_command(delta)
 	_update_behavior(delta, state)
 	_update_locomotion(delta)
 	if _gesture != "":
@@ -246,10 +262,13 @@ func _on_conversation_start() -> void:
 	var away := _clock - _last_engaged
 	_asleep = false
 	_sleep_walk = false
-	_sit_goal = 0.0
+	if not _sit_hold:
+		_sit_goal = 0.0
 	_behavior = "converse"
 	# Come over if it wandered off; otherwise just turn around to face you.
-	if _pos.distance_to(HOME) > 0.7:
+	if _command != "":
+		pass
+	elif _pos.distance_to(HOME) > 0.7 and not _sit_hold:
 		_walk_to(HOME + Vector2(_rng.randf_range(-0.35, 0.35), _rng.randf_range(-0.1, 0.15)))
 	else:
 		_walking = false
@@ -258,10 +277,70 @@ func _on_conversation_start() -> void:
 
 
 func _camera_local() -> Vector3:
+	# Where the owner actually is when the camera sees them; else the screen.
+	if _vision_seen and _clock < _vision_fresh_until:
+		return _vision_point
 	var camera := get_viewport().get_camera_3d()
 	if camera == null:
 		return Vector3(0.0, 1.0, 5.0)
 	return to_local(camera.global_position)
+
+
+## Host perception events (miko_vision.py via the voice relay):
+## {"type":"vision","seen":bool,"x","y","size"} with x/y from the viewer's side,
+## or {"type":"vision_event","event":"wave"|"arrived"|"left"|"approached"}.
+func on_vision(event: Dictionary) -> void:
+	if str(event.get("type", "")) == "vision":
+		_vision_seen = bool(event.get("seen", false))
+		_vision_fresh_until = _clock + 1.5
+		if _vision_seen:
+			_vision_last_seen = _clock
+			var camera := get_viewport().get_camera_3d()
+			if camera != null:
+				var basis := camera.global_transform.basis
+				# The owner sits behind the screen; closer faces look bigger.
+				var distance := clampf(0.55 / maxf(float(event.get("size", 0.2)), 0.05), 1.2, 4.0)
+				var head := camera.global_position \
+					+ basis.x * (float(event.get("x", 0.0)) * 0.45 * distance) \
+					+ basis.y * (float(event.get("y", 0.0)) * 0.32 * distance - 0.1) \
+					+ basis.z * (distance - 1.0)
+				_vision_point = to_local(head)
+		return
+	match str(event.get("event", "")):
+		"wave":
+			# Wave back, the way a person would: turn to them, smile, wave.
+			if _command != "" and _command not in ["sit", "look_around"]:
+				return
+			if _asleep or _sleep_walk:
+				_asleep = false
+				_sleep_walk = false
+			if not _sit_hold:
+				_sit_goal = 0.0
+			_walking = false
+			_look_user = true
+			_face_yaw_goal = _yaw_toward(_camera_local())
+			_queue_gesture("wave", 2.3, 1.0, true)
+			_behavior = "linger"
+			_behavior_left = _rng.randf_range(4.0, 7.0)
+		"arrived":
+			var away := _clock - _vision_last_seen
+			if _asleep:
+				_asleep = false
+				_sit_goal = 0.0
+				_queue_gesture("stretch", 3.2, 0.0, true)
+			elif _command == "":
+				_look_user = true
+				_face_yaw_goal = _yaw_toward(_camera_local())
+				_queue_gesture("wave" if away > 60.0 else "tilt", 2.3 if away > 60.0 else 1.4, 1.0, away > 60.0)
+				_behavior = "linger"
+				_behavior_left = _rng.randf_range(3.0, 5.0)
+		"left":
+			if _command == "" and not _asleep:
+				_queue_gesture("glance", 2.0)
+		"approached":
+			_surprise_left = 1.6
+			if _command == "" and _gesture == "":
+				_queue_gesture("tilt", 1.3)
 
 
 func _yaw_toward(point: Vector3) -> float:
@@ -298,6 +377,11 @@ func _update_behavior(delta: float, state: Dictionary) -> void:
 	if state["engaged"]:
 		_converse(delta, state)
 		return
+	if _command != "" or _sit_hold:
+		# Doing what the owner asked; only glance around meanwhile.
+		if _look_wait <= 0.0 and _command == "":
+			_pick_look_point()
+		return
 	if _asleep:
 		_look_user = false
 		_sleep_left -= delta
@@ -332,8 +416,9 @@ func _update_behavior(delta: float, state: Dictionary) -> void:
 
 func _converse(delta: float, state: Dictionary) -> void:
 	_look_user = true
-	_sit_goal = 0.0
-	if not _walking:
+	if not _sit_hold:
+		_sit_goal = 0.0
+	if not _walking and _command == "":
 		_face_yaw_goal = _yaw_toward(_camera_local())
 	if state["speaking"]:
 		_beat_wait -= delta
@@ -450,7 +535,9 @@ func _behavior_tick(_delta: float, _state: Dictionary) -> void:
 
 func _pick_look_point() -> void:
 	_look_wait = _rng.randf_range(1.4, 3.6)
-	if _rng.randf() < 0.3:
+	# Glance at the owner now and then; rarely if the camera sees nobody.
+	var nobody := _clock < _vision_fresh_until and not _vision_seen
+	if _rng.randf() < (0.06 if nobody else 0.3):
 		_look_user = true
 		return
 	_look_user = false
@@ -463,6 +550,141 @@ func _pick_look_point() -> void:
 func _go_to_sleep() -> void:
 	_sleep_walk = true
 	_walk_to(DOCK)
+
+
+# ------------------------------------------------------------------ owner commands
+
+## Perform a body action the owner asked for (Realtime tool miko_perform_action).
+## Directions are from the owner's point of view: screen left/right, "forward"
+## toward the owner, "back" away from them.
+func perform_command(action: String, times: int = 1) -> void:
+	times = clampi(times, 1, 5)
+	if action not in ["sleep", "stop"] and (_asleep or _sleep_walk):
+		_asleep = false
+		_sleep_walk = false
+		_sit_goal = 0.0
+	if action not in ["sit", "think", "nod", "shake_head", "laugh", "look_around"]:
+		_release_sit()
+	_gesture_queue.clear()
+	_backward = false
+	_command = action
+	_command_left = 2.5
+	_look_user = true
+	match action:
+		"walk_forward":
+			_command_walk(_pick_forward_goal())
+		"walk_back":
+			_command_walk(_pos + Vector2(0.0, -0.6))
+			_backward = true                      # step back while facing you
+		"walk_left":
+			_command_walk(_pos + Vector2(-0.7, 0.0))
+		"walk_right":
+			_command_walk(_pos + Vector2(0.7, 0.0))
+		"come_here":
+			var camera := _camera_local()
+			_command_walk(Vector2(clampf(camera.x, STAGE_MIN.x + 0.3, STAGE_MAX.x - 0.3), STAGE_MAX.y - 0.08))
+		"go_away":
+			_command_walk(Vector2(_pos.x * 0.6, STAGE_MIN.y + 0.08))
+		"turn_around":
+			_walking = false
+			_spin_left = PI * (1.0 if _rng.randf() < 0.5 else -1.0)
+			_command_left = 4.0                   # show its back for a moment
+		"spin":
+			_walking = false
+			_spin_left = TAU * minf(times, 2) * (1.0 if _rng.randf() < 0.5 else -1.0)
+		"jump":
+			_queue_repeated("hop", 1.1, times)
+		"wave":
+			_face_yaw_goal = _yaw_toward(_camera_local())
+			_queue_repeated("wave", 2.3, mini(times, 2))
+		"nod":
+			_queue_repeated("nod", 1.0, times)
+		"shake_head":
+			_queue_repeated("shake_head", 1.2, times)
+		"dance":
+			_queue_repeated("dance", 3.6, mini(times, 2))
+		"stretch":
+			_queue_repeated("stretch", 3.4, 1)
+		"think":
+			_queue_repeated("think", 3.0, 1)
+		"laugh":
+			_queue_repeated("laugh", 1.9, 1)
+		"look_around":
+			_command_left = 5.0
+			_pick_look_point()
+			_look_user = false
+		"sit":
+			_walking = false
+			_sit_hold = true
+			_sit_hold_left = 120.0
+			_sit_goal = 1.0
+			_command = ""
+		"stand_up":
+			_command_left = 1.5
+		"sleep":
+			_command = ""
+			_go_to_sleep()
+		"wake_up":
+			_queue_repeated("stretch", 3.4, 1)
+		"stop", _:
+			_walking = false
+			_spin_left = 0.0
+			_gesture = ""
+			_command_left = 1.0
+			_face_yaw_goal = _yaw_toward(_camera_local())
+
+
+func _command_walk(goal: Vector2) -> void:
+	_gesture = ""
+	_walk_to(goal)
+	if not _walking:
+		# Already at the edge: a small shuffle and a look back says "can't go further".
+		_queue_gesture("shake_head", 1.1, 0.0, true)
+
+
+func _pick_forward_goal() -> Vector2:
+	var ahead := Vector2(sin(_yaw), cos(_yaw))
+	var goal := _pos + ahead * 0.65
+	var clamped := Vector2(clampf(goal.x, STAGE_MIN.x, STAGE_MAX.x), clampf(goal.y, STAGE_MIN.y, STAGE_MAX.y))
+	if clamped.distance_to(_pos) < 0.25:
+		# Facing a desk edge: walk across the desk instead.
+		goal = _pos + Vector2(-0.65 if _pos.x > 0.0 else 0.65, -0.2)
+	return goal
+
+
+func _queue_repeated(name: String, length: float, times: int) -> void:
+	_gesture = ""
+	for i in times:
+		_gesture_queue.append([name, length])
+	_command_left = 0.5
+
+
+func _release_sit() -> void:
+	_sit_hold = false
+	_sit_goal = 0.0
+
+
+func _update_command(delta: float) -> void:
+	if _sit_hold:
+		_sit_hold_left -= delta
+		if _sit_hold_left <= 0.0:
+			_release_sit()
+	if _gesture == "" and not _gesture_queue.is_empty():
+		var next: Array = _gesture_queue.pop_front()
+		_queue_gesture(next[0], next[1], 1.0 if next[0] == "wave" else 0.0, true)
+		_gesture_len = next[1]                  # repeated jumps keep an even rhythm
+	if _command == "":
+		return
+	var busy := _walking or _spin_left != 0.0 or _gesture != "" or not _gesture_queue.is_empty()
+	if busy:
+		return
+	_command_left -= delta
+	if _command_left <= 0.0:
+		_command = ""
+		_backward = false
+		_behavior = "linger"
+		_behavior_left = _rng.randf_range(3.0, 6.0)
+		_face_yaw_goal = _yaw_toward(_camera_local())
 
 
 # ------------------------------------------------------------------ locomotion
@@ -491,12 +713,13 @@ func _update_locomotion(delta: float) -> void:
 		if distance < 0.04:
 			_walking = false
 		else:
-			var dyaw := wrapf(atan2(to.x, to.y) - _yaw, -PI, PI)
+			var heading := atan2(to.x, to.y) + (PI if _backward else 0.0)
+			var dyaw := wrapf(heading - _yaw, -PI, PI)
 			turning = _steer(clampf(dyaw * 3.0, -TURN_RATE, TURN_RATE), delta)
 			var align := clampf(1.0 - absf(dyaw) / 1.2, 0.0, 1.0)
 			# Slow down smoothly on approach (no abrupt stop at the target).
 			var arrive := clampf(distance / 0.35, 0.0, 1.0)
-			var goal_speed := WALK_SPEED * align * lerpf(0.25, 1.0, arrive)
+			var goal_speed := WALK_SPEED * align * lerpf(0.25, 1.0, arrive) * (0.55 if _backward else 1.0)
 			_speed = move_toward(_speed, goal_speed, delta * 0.9)
 	if not (_walking and can_move):
 		_speed = move_toward(_speed, 0.0, delta * 1.1)
@@ -516,7 +739,7 @@ func _update_locomotion(delta: float) -> void:
 			turning = _steer(rate, delta)
 		else:
 			_steer(0.0, delta)
-	_pos += Vector2(sin(_yaw), cos(_yaw)) * _speed * delta
+	_pos += Vector2(sin(_yaw), cos(_yaw)) * _speed * delta * (-1.0 if _backward else 1.0)
 	_pos = Vector2(clampf(_pos.x, STAGE_MIN.x, STAGE_MAX.x), clampf(_pos.y, STAGE_MIN.y, STAGE_MAX.y))
 	var gait := clampf(_speed / WALK_SPEED, 0.0, 1.0)
 	_step_amp = lerpf(_step_amp, maxf(gait, turning * 0.5), 1.0 - exp(-delta * 5.0))
@@ -524,10 +747,11 @@ func _update_locomotion(delta: float) -> void:
 	var stride := 4.0 * LEG * sin(THIGH_SWING * maxf(_step_amp, 0.35))
 	var phase_rate := TAU * _speed / maxf(stride, 0.05)
 	phase_rate = maxf(phase_rate, turning * 6.5)          # stepping in place while turning
-	_phase += delta * phase_rate
+	_phase += delta * phase_rate * (-1.0 if _backward and _speed > 0.01 else 1.0)
 	# Lean into acceleration and a little into speed.
 	var accel := (_speed - previous_speed) / maxf(delta, 0.0001)
-	_lean = lerpf(_lean, 0.10 * gait + clampf(accel * 0.12, -0.06, 0.08), 1.0 - exp(-delta * 4.0))
+	var lean_goal := (0.10 * gait + clampf(accel * 0.12, -0.06, 0.08)) * (-0.5 if _backward else 1.0)
+	_lean = lerpf(_lean, lean_goal, 1.0 - exp(-delta * 4.0))
 	_sit = move_toward(_sit, _sit_goal, delta * 0.9)
 	if _model != null:
 		_model.position = Vector3(_pos.x, 0.0, _pos.y)
@@ -640,6 +864,8 @@ func _gesture_pose(q: Dictionary, root: Array) -> Dictionary:
 			_add(q, "head", Quaternion(RIGHT, 0.16 * sin(t * TAU * 2.0) * e))
 		"tilt":
 			_add(q, "head", Quaternion(FORWARD, s * 0.17 * e))
+		"shake_head":
+			_add(q, "head", Quaternion(UP, 0.32 * sin(t * TAU * 2.5) * e))
 		"hum":
 			_add(q, "head", Quaternion(FORWARD, 0.07 * sin(t * TAU * 4.0) * e) * Quaternion(RIGHT, 0.04 * sin(t * TAU * 8.0) * e))
 			_add(q, "spine", Quaternion(FORWARD, -0.03 * sin(t * TAU * 4.0) * e))
@@ -808,6 +1034,10 @@ func _update_face(delta: float, state: Dictionary) -> void:
 		goal["smile"] = 0.8
 	if state["listening"]:
 		goal["size"] = maxf(goal["size"], 1.05)
+	_surprise_left = maxf(0.0, _surprise_left - delta)
+	if _surprise_left > 0.0:
+		goal["surprise"] = maxf(goal["surprise"], 0.7)
+		goal["size"] = maxf(goal["size"], 1.12)
 	if _asleep:
 		goal["open_base"] = 0.0
 		goal["power"] = 0.38

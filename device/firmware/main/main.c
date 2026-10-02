@@ -37,6 +37,10 @@ static uint8_t s_heard_content_indices[8];
 static size_t s_heard_item_count;
 static char s_camera_request[37];
 static TickType_t s_camera_deadline;
+static bool s_vision_active;
+static TickType_t s_vision_interval;
+static TickType_t s_vision_next;
+static uint32_t s_vision_sequence;
 static uint8_t *s_rx_data;
 static size_t s_rx_total;
 static uint8_t s_rx_opcode;
@@ -208,6 +212,7 @@ static bool authenticate(const char *server_nonce)
     cJSON_AddItemToArray(caps, cJSON_CreateString("display"));
     cJSON_AddItemToArray(caps, cJSON_CreateString("gesture"));
     if (s_config.camera_enabled) cJSON_AddItemToArray(caps, cJSON_CreateString("camera"));
+    if (s_config.vision_enabled) cJSON_AddItemToArray(caps, cJSON_CreateString("vision"));
     memset(proof_bytes, 0, sizeof proof_bytes);
     memset(canonical, 0, sizeof canonical);
     return ws_send_json(object);
@@ -236,6 +241,8 @@ static void reset_connection(void)
     s_suppress_output = false;
     s_uplink_sequence = s_downlink_sequence = 0;
     s_camera_request[0] = '\0';
+    if (s_vision_active) miko_board_vision_stop();
+    s_vision_active = false;
     clear_playback();
     miko_board_display("offline", "Reconnecting to Miko");
 }
@@ -296,6 +303,24 @@ static void process_control(const uint8_t *data, size_t length)
             snprintf(s_camera_request, sizeof s_camera_request, "%s", item->valuestring);
             s_camera_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(expires->valueint);
             miko_board_camera_prompt((uint32_t)expires->valueint);
+        }
+    } else if (strcmp(kind, "vision_stream") == 0) {
+        const cJSON *active = cJSON_GetObjectItemCaseSensitive(object, "active");
+        if (cJSON_IsTrue(active) && s_config.vision_enabled) {
+            const cJSON *fps = cJSON_GetObjectItemCaseSensitive(object, "fps");
+            const cJSON *width = cJSON_GetObjectItemCaseSensitive(object, "width");
+            const cJSON *height = cJSON_GetObjectItemCaseSensitive(object, "height");
+            uint32_t rate = cJSON_IsNumber(fps) && fps->valueint >= 1 && fps->valueint <= 6 ? (uint32_t)fps->valueint : 4;
+            uint32_t w = cJSON_IsNumber(width) && width->valueint > 0 && width->valueint <= 320 ? (uint32_t)width->valueint : 240;
+            uint32_t h = cJSON_IsNumber(height) && height->valueint > 0 && height->valueint <= 240 ? (uint32_t)height->valueint : 180;
+            if (!s_vision_active && miko_board_vision_start(rate, w, h) == ESP_OK) {
+                s_vision_active = true;
+                s_vision_interval = pdMS_TO_TICKS(1000 / rate);
+                s_vision_next = xTaskGetTickCount();
+            }
+        } else if (s_vision_active) {
+            miko_board_vision_stop();
+            s_vision_active = false;
         }
     } else if (strcmp(kind, "error") == 0) {
         miko_board_display("error", "Voice service error");
@@ -372,6 +397,32 @@ static void maybe_send_camera(void)
     s_camera_request[0] = '\0';
 }
 
+static void maybe_send_vision(void)
+{
+    if (!s_vision_active || (int32_t)(xTaskGetTickCount() - s_vision_next) < 0) return;
+    uint8_t *jpeg = NULL;
+    size_t size = 0;
+    if (miko_board_vision_frame(&jpeg, &size) != ESP_OK || !jpeg) return;
+    s_vision_next = xTaskGetTickCount() + s_vision_interval;
+    if (size >= 4 && size <= MIKO_VISION_JPEG_MAX && jpeg[0] == 0xff && jpeg[1] == 0xd8 &&
+        jpeg[size-2] == 0xff && jpeg[size-1] == 0xd9) {
+        uint8_t *frame = malloc(5 + size);
+        if (frame) {
+            frame[0] = 0x04;
+            frame[1] = (uint8_t)(s_vision_sequence >> 24);
+            frame[2] = (uint8_t)(s_vision_sequence >> 16);
+            frame[3] = (uint8_t)(s_vision_sequence >> 8);
+            frame[4] = (uint8_t)s_vision_sequence;
+            memcpy(frame + 5, jpeg, size);
+            if (esp_websocket_client_send_bin(s_ws, (const char *)frame, (int)(5 + size), WS_WAIT) != (int)(5 + size))
+                s_fatal = true;
+            s_vision_sequence++;
+            free(frame);
+        }
+    }
+    miko_board_vision_discard(jpeg);
+}
+
 void app_main(void)
 {
     memset(&s_config, 0, sizeof s_config);
@@ -441,6 +492,7 @@ void app_main(void)
             memmove(s_pending_audio_done, s_pending_audio_done + 1, (--s_pending_done_count) * 65);
         }
         maybe_send_camera();
+        maybe_send_vision();
         if (capture) {
             size_t count = MIC_SAMPLES;
             if (miko_board_mic_read(samples, &count, 20) == ESP_OK && count <= MIC_SAMPLES)

@@ -26,6 +26,7 @@ from .protocol import (
     decode_downlink_pcm,
     decode_pairing_secret,
     encode_camera_jpeg,
+    encode_vision_jpeg,
     encode_uplink_pcm,
     new_nonce,
     pairing_proof,
@@ -119,6 +120,9 @@ async def run(args: argparse.Namespace) -> None:
             capabilities = ["audio", "display", "gesture"]
             if args.camera_file:
                 capabilities.append("camera")
+            vision_file = getattr(args, "vision_file", None)
+            if vision_file:
+                capabilities.append("vision")
             await ws.send(json.dumps({
                 "type": "authenticate", "device_id": args.device_id,
                 "client_nonce": client_nonce,
@@ -132,9 +136,19 @@ async def run(args: argparse.Namespace) -> None:
             ready = asyncio.Event()
             done = asyncio.Event()
             expected_downlink = 0
+            vision_task: asyncio.Task | None = None
+
+            async def stream_vision(fps: float) -> None:
+                # Stands in for the device camera: the same small JPEG, looped.
+                jpeg = Path(vision_file).read_bytes()
+                sequence = 0
+                while True:
+                    await ws.send(encode_vision_jpeg(sequence, jpeg))
+                    sequence = (sequence + 1) & 0xFFFFFFFF
+                    await asyncio.sleep(1.0 / max(1.0, fps))
 
             async def reader() -> None:
-                nonlocal expected_downlink
+                nonlocal expected_downlink, vision_task
                 async for payload in ws:
                     if isinstance(payload, bytes):
                         sequence, item_id, _content_index, pcm = decode_downlink_pcm(payload)
@@ -166,6 +180,13 @@ async def run(args: argparse.Namespace) -> None:
                         if answer.strip().lower() == "y":
                             jpeg = Path(args.camera_file).read_bytes()
                             await ws.send(encode_camera_jpeg(event["request_id"], jpeg))
+                    elif kind == "vision_stream":
+                        if vision_task:
+                            vision_task.cancel()
+                            vision_task = None
+                        if event.get("active") and vision_file:
+                            print("vision stream requested at", event.get("fps"), "fps")
+                            vision_task = asyncio.create_task(stream_vision(float(event.get("fps", 4))))
                     elif kind == "response_done" and not event.get("has_tool_calls"):
                         done.set()
                     elif kind in {"status", "transcript", "gesture", "error", "device_session"}:
@@ -189,6 +210,8 @@ async def run(args: argparse.Namespace) -> None:
                 except asyncio.TimeoutError:
                     pass
             finally:
+                if vision_task:
+                    vision_task.cancel()
                 task.cancel()
                 try:
                     await task
@@ -214,6 +237,7 @@ def main() -> None:
     parser.add_argument("--wav-out", help="record received PCM to a 24 kHz WAV; never acknowledges playback")
     parser.add_argument("--speaker", action="store_true", help="play through a real speaker and acknowledge completion")
     parser.add_argument("--camera-file", help="JPEG offered only after a server request and interactive confirmation")
+    parser.add_argument("--vision-file", help="small JPEG streamed as perception frames when the server asks")
     parser.add_argument("--wait-seconds", type=float, default=30)
     args = parser.parse_args()
     try:

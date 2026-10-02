@@ -11,6 +11,7 @@
 #include "esp_err.h"
 
 #define MIKO_JPEG_MAX 160000
+#define MIKO_VISION_JPEG_MAX 24000
 
 typedef struct {
     char device_id[33];
@@ -18,6 +19,7 @@ typedef struct {
     const char *pinned_cert_pem;      /* NUL-terminated PEM; TLS verification required */
     uint8_t pairing_secret[32];      /* read from provisioned NVS */
     bool camera_enabled;             /* false until owner explicitly provisions it */
+    bool vision_enabled;             /* owner-provisioned perception stream (presence, waves) */
     bool hands_free;                  /* board must supply AEC and visible mic state */
 } miko_board_config_t;
 
@@ -43,6 +45,8 @@ typedef struct {
 bool miko_board_playback_cursor(miko_playback_cursor_t *cursor);
 void miko_board_display(const char *status, const char *detail);
 void miko_board_caption(const char *role, const char *text);
+/* action may be any miko_perform_action body action (wave, jump, walk_left,
+ * dance, sit, ...) or an expression cue; animate what the screen can show. */
 void miko_board_gesture(const char *emotion, const char *action);
 
 /* Camera requires a fresh on-screen prompt and a local physical button press.
@@ -53,3 +57,16 @@ void miko_board_camera_prompt(uint32_t expires_ms);
 bool miko_board_camera_confirmed(void);
 esp_err_t miko_board_camera_capture(uint8_t **jpeg, size_t *length);
 void miko_board_camera_discard(uint8_t *jpeg);
+
+/* Perception stream ("Miko sees you"): small, low-rate JPEG frames that the
+ * server analyses in memory for presence, position and waves. Frames are never
+ * stored on the device or server. Only while the server sent vision_stream
+ * active=true (owner toggle) and vision_enabled was provisioned.
+ * start: configure the sensor for about width x height at fps and turn ON a
+ * visible camera indicator (LED or on-screen dot) for as long as it streams.
+ * frame: non-blocking; return ESP_ERR_NOT_FOUND when no new frame is ready;
+ * JPEG must be <= MIKO_VISION_JPEG_MAX bytes. stop: sensor off, indicator off. */
+esp_err_t miko_board_vision_start(uint32_t fps, uint32_t width, uint32_t height);
+esp_err_t miko_board_vision_frame(uint8_t **jpeg, size_t *length);
+void miko_board_vision_discard(uint8_t *jpeg);
+void miko_board_vision_stop(void);

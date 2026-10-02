@@ -204,6 +204,9 @@ var barge_in_cooldown := 0.0
 const BARGE_IN_COOLDOWN_SECONDS := 0.18
 
 var action_playing := false
+var vision_enabled := true
+var vision_available := false
+var realtime_camera_button: Button
 var sleeping_pose := false
 
 # These belong to the ONE speech request currently in flight.
@@ -1657,6 +1660,9 @@ func _setup_microphone() -> void:
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.keycode == KEY_F8 and event.pressed and not event.echo:
 		_open_voice_conversation()
+		get_viewport().set_input_as_handled()
+	if event is InputEventKey and event.keycode == KEY_F7 and event.pressed and not event.echo:
+		_toggle_vision()
 		get_viewport().set_input_as_handled()
 
 
@@ -5037,6 +5043,7 @@ func _setup_realtime_voice() -> void:
 	realtime_voice.turn_started.connect(_on_realtime_turn_started)
 	realtime_voice.speaking_changed.connect(_on_realtime_speaking)
 	realtime_voice.tool_result.connect(_on_realtime_tool)
+	realtime_voice.vision_update.connect(_on_realtime_vision)
 	_setup_voice_controls()
 	add_child(realtime_voice)
 
@@ -5093,6 +5100,14 @@ func _setup_voice_controls() -> void:
 	_style_voice_button(open_button, Color(0.14, 0.20, 0.27, 1.0))
 	open_button.pressed.connect(_open_voice_conversation)
 	row.add_child(open_button)
+	realtime_camera_button = Button.new()
+	realtime_camera_button.focus_mode = Control.FOCUS_NONE
+	realtime_camera_button.custom_minimum_size = Vector2(70, 38)
+	realtime_camera_button.add_theme_font_size_override("font_size", 14)
+	realtime_camera_button.disabled = miko_preview_mode
+	realtime_camera_button.pressed.connect(_toggle_vision)
+	row.add_child(realtime_camera_button)
+	_refresh_camera_button()
 	realtime_status_label = Label.new()
 	realtime_status_label.text = "תצוגה מקדימה" if miko_preview_mode else "SPACE: לדבר · F8: שיחה בלי לחצן"
 	realtime_status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -5437,3 +5452,53 @@ func _on_realtime_tool(name: String, result: Variant) -> void:
 	if name == "miko_set_expression" and result is Dictionary:
 		_set_face_emotion(str(result.get("emotion", "curious")), 8.0)
 		_play_brain_action(str(result.get("action", "look")))
+	if name == "miko_perform_action" and result is Dictionary and result.get("ok", false):
+		_perform_body_command(str(result.get("action", "")), int(result.get("times", 1)))
+
+
+# Camera: perception runs locally in the host; Godot only gets derived facts.
+func _on_realtime_vision(event: Dictionary) -> void:
+	if str(event.get("type", "")) == "vision_status":
+		vision_enabled = bool(event.get("enabled", false))
+		vision_available = bool(event.get("available", false)) and str(event.get("source", "off")) != "off"
+		_refresh_camera_button()
+		return
+	var character := get_node_or_null("MikoScene")
+	if character != null and character.has_method("on_vision"):
+		character.call("on_vision", event)
+
+
+func _toggle_vision() -> void:
+	if miko_preview_mode or realtime_voice == null:
+		return
+	vision_enabled = not vision_enabled
+	realtime_voice.set_vision_enabled(vision_enabled)
+	if not vision_enabled:
+		_on_realtime_vision({"type": "vision", "seen": false})
+	_refresh_camera_button()
+
+
+func _refresh_camera_button() -> void:
+	if realtime_camera_button == null:
+		return
+	var watching := vision_enabled and vision_available
+	if watching:
+		realtime_camera_button.text = "● מצלמה"
+	elif vision_enabled:
+		realtime_camera_button.text = "מצלמה…"      # starting, or no webcam found
+	else:
+		realtime_camera_button.text = "מצלמה כבויה"
+	realtime_camera_button.tooltip_text = "F7: הפעל/כבה את הראייה של מיקו (מעובד רק במחשב הזה)"
+	_style_voice_button(realtime_camera_button, Color(0.12, 0.32, 0.26, 1.0) if watching else Color(0.20, 0.20, 0.24, 1.0))
+
+
+# Voice-commanded body actions ("תלך", "תקפוץ", "תעשה שלום") go straight to
+# a character that implements perform_command(); older avatars fall back to
+# the nearest animation cue.
+func _perform_body_command(action: String, times: int) -> void:
+	var character := get_node_or_null("MikoScene")
+	if character != null and character.has_method("perform_command"):
+		character.call("perform_command", action, times)
+		return
+	var fallback := {"jump": "bounce", "wave": "wave", "dance": "dance", "spin": "roll", "sleep": "sleep", "laugh": "laugh"}
+	_play_brain_action(str(fallback.get(action, "look")))

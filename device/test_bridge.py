@@ -22,6 +22,7 @@ from device.bridge import BridgeSettings, DeviceBridge, DeviceConfigError, Devic
 from device.protocol import (
     decode_downlink_pcm,
     encode_camera_jpeg,
+    encode_vision_jpeg,
     encode_uplink_pcm,
     new_nonce,
     pairing_proof,
@@ -39,10 +40,20 @@ def _openssl() -> str | None:
     )
 
 
+class _FakeVision:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.frames: list[bytes] = []
+
+    def feed_jpeg(self, jpeg: bytes) -> None:
+        self.frames.append(jpeg)
+
+
 class _FakeHub:
     def __init__(self) -> None:
         self.native: set = set()
         self.browser_id = None
+        self.vision = _FakeVision()
 
 
 class _FakeNative:
@@ -161,7 +172,7 @@ class DeviceBridgeTests(unittest.TestCase):
                 "tls_cert": str(cert), "tls_key": str(key),
                 "paired_devices": [{
                     "device_id": "miko_s3", "pairing_secret_b64": base64.b64encode(secret).decode("ascii"),
-                    "capabilities": ["audio", "display", "gesture", "camera"],
+                    "capabilities": ["audio", "display", "gesture", "camera", "vision"],
                 }],
             }), encoding="utf-8")
             hub = _FakeHub()
@@ -216,6 +227,35 @@ class DeviceBridgeTests(unittest.TestCase):
                     jpeg = b"\xff\xd8temporary-test-image\xff\xd9"
                     await device.send(encode_camera_jpeg(requested["request_id"], jpeg))
                     self.assertEqual(await snapshot, jpeg)
+
+                # Perception frames: only after the server asks, rate bounded,
+                # and stopped by the owner's camera toggle.
+                async with connect(url, ssl=tls) as seeing:
+                    challenge = json.loads(await seeing.recv())
+                    nonce = new_nonce()
+                    await seeing.send(json.dumps({
+                        "type": "authenticate", "device_id": "miko_s3", "client_nonce": nonce,
+                        "proof": pairing_proof(secret, "miko_s3", challenge["server_nonce"], nonce),
+                        "capabilities": ["audio", "vision"],
+                    }))
+                    self.assertTrue(json.loads(await seeing.recv())["resumed"])
+                    messages = [json.loads(await seeing.recv()) for _ in range(2)]
+                    stream = next(m for m in messages if m["type"] == "vision_stream")
+                    self.assertTrue(stream["active"])
+                    self.assertLessEqual(stream["fps"], 6)
+                    frame = b"\xff\xd8small-frame\xff\xd9"
+                    for i in range(5):                       # a burst: most are dropped
+                        await seeing.send(encode_vision_jpeg(i, frame))
+                    await asyncio.sleep(0.2)
+                    self.assertGreaterEqual(len(hub.vision.frames), 1)
+                    self.assertLess(len(hub.vision.frames), 5)
+                    hub.vision.enabled = False
+                    await bridge.set_vision_stream()
+                    self.assertEqual(json.loads(await seeing.recv()), {"type": "vision_stream", "active": False})
+                    await seeing.send(encode_vision_jpeg(9, frame))
+                    with self.assertRaises(ConnectionClosed):
+                        await asyncio.wait_for(seeing.recv(), 2)
+                    hub.vision.enabled = True
 
                 # The same authenticated device resumes one logical session.
                 async with connect(url, ssl=tls) as resumed_device:
@@ -307,7 +347,7 @@ class DeviceBridgeTests(unittest.TestCase):
                 output = root / "speaker.wav"
                 args = argparse.Namespace(
                     url=url, ca=str(cert), device_id="miko_s3", secret_file=str(secret_file),
-                    speaker=False, wav_out=str(output), camera_file=None,
+                    speaker=False, wav_out=str(output), camera_file=None, vision_file=None,
                     text="test", wav_in=None, mic_seconds=None, wait_seconds=2,
                 )
                 await run_simulator(args)

@@ -8,6 +8,9 @@ signal final_transcript(item_id: String, session_id: String)
 signal speaking_changed(active: bool)
 signal tool_result(name: String, result: Variant)
 signal external_voice_changed(active: bool)
+## Local camera perception from the host: "vision" (where the owner is),
+## "vision_event" (wave/arrived/left/approached) and "vision_status".
+signal vision_update(event: Dictionary)
 
 const RELAY_URL := "ws://127.0.0.1:5001/voice"
 const MIC_BUS := "MikoRealtimeMic"
@@ -352,6 +355,8 @@ func _handle_event(event: Dictionary) -> void:
 			_set_external_voice(bool(event.get("active", false)))
 		"tool_result":
 			tool_result.emit(str(event.get("name", "")), event.get("result"))
+		"vision", "vision_event", "vision_status":
+			vision_update.emit(event)
 		"error":
 			status_changed.emit("error", str(event.get("message", "Voice relay error")))
 			if bool(event.get("retryable", false)):
@@ -841,3 +846,7 @@ func _fail_transport(message: String) -> void:
 	status_changed.emit("error", message)
 	if _socket != null and _socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		_socket.close(1011, "Voice transport stalled")
+
+
+func set_vision_enabled(enabled: bool) -> void:
+	_send({"type": "vision_toggle", "enabled": enabled})
