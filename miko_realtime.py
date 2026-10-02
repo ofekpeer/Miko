@@ -634,6 +634,8 @@ class RealtimeHub:
         self.native.add(native)
         try:
             await native.send({'type':'status','status':'idle','detail':'Hold SPACE to speak | F8: open voice conversation'})
+            if self.vision:
+                await native.send(self.vision.status_event())
             if self.browser_id:
                 await native.send({'type':'external_voice','active':True})
             async for payload in ws:

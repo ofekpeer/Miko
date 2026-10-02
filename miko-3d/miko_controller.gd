@@ -206,6 +206,7 @@ const BARGE_IN_COOLDOWN_SECONDS := 0.18
 var action_playing := false
 var vision_enabled := true
 var vision_available := false
+var vision_error := ""
 var realtime_camera_button: Button
 var sleeping_pose := false
 
@@ -5461,6 +5462,7 @@ func _on_realtime_vision(event: Dictionary) -> void:
 	if str(event.get("type", "")) == "vision_status":
 		vision_enabled = bool(event.get("enabled", false))
 		vision_available = bool(event.get("available", false)) and str(event.get("source", "off")) != "off"
+		vision_error = str(event.get("error", ""))
 		_refresh_camera_button()
 		return
 	var character := get_node_or_null("MikoScene")
@@ -5484,11 +5486,19 @@ func _refresh_camera_button() -> void:
 	var watching := vision_enabled and vision_available
 	if watching:
 		realtime_camera_button.text = "● מצלמה"
+	elif vision_enabled and vision_error == "opencv_missing":
+		realtime_camera_button.text = "חסר OpenCV"
+	elif vision_enabled and vision_error == "webcam_unavailable":
+		realtime_camera_button.text = "אין גישה למצלמה"
 	elif vision_enabled:
-		realtime_camera_button.text = "מצלמה…"      # starting, or no webcam found
+		realtime_camera_button.text = "מצלמה…"      # starting
 	else:
 		realtime_camera_button.text = "מצלמה כבויה"
 	realtime_camera_button.tooltip_text = "F7: הפעל/כבה את הראייה של מיקו (מעובד רק במחשב הזה)"
+	if vision_error == "opencv_missing":
+		realtime_camera_button.tooltip_text += "\nהרץ את Check Miko Camera.cmd כדי להתקין"
+	elif vision_error == "webcam_unavailable":
+		realtime_camera_button.tooltip_text += "\nהמצלמה תפוסה באפליקציה אחרת או חסומה בהגדרות הפרטיות של Windows"
 	_style_voice_button(realtime_camera_button, Color(0.12, 0.32, 0.26, 1.0) if watching else Color(0.20, 0.20, 0.24, 1.0))
 
 

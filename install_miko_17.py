@@ -19,6 +19,7 @@ with winreg.OpenKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\Curren
 protected=['miko_brain_state.json','miko_credentials.dat','miko_integrations.json',
            'miko_brain_state_before_migration.json','miko_device_settings.json']
 sources=['miko_brain.py','miko_realtime.py','miko_realtime_tools.py','miko_vision.py','miko_voice.html',
+         'check_miko_camera.py','Check Miko Camera.cmd',
          'start_miko.py','Start Miko.cmd','stop_miko.py','Stop Miko.cmd','requirements_miko.txt']
 excluded={'.godot','.git','__pycache__'}
 for name in sources:

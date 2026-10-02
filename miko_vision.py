@@ -330,9 +330,12 @@ class VisionService:
             self.start()
         self._status()
 
+    def status_event(self) -> dict[str, Any]:
+        return {"type": "vision_status", "enabled": self.enabled, "source": self.source,
+                "available": available(), "error": self.error}
+
     def _status(self) -> None:
-        self.emit({"type": "vision_status", "enabled": self.enabled, "source": self.source,
-                   "available": available(), "error": self.error})
+        self.emit(self.status_event())
 
     def summary(self) -> dict[str, Any]:
         if not self.enabled:
@@ -350,29 +353,59 @@ class VisionService:
         self._thread = threading.Thread(target=self._webcam_loop, name="MikoVisionWebcam", daemon=True)
         self._thread.start()
 
+    @staticmethod
+    def open_webcam():
+        """Try the usual Windows backends and the first camera indices; return
+        (capture, description) for the first one that delivers a frame."""
+        wanted = os.environ.get("MIKO_CAMERA_INDEX", "").strip()
+        indices = [int(wanted)] if wanted.isdigit() else [0, 1, 2]
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if os.name == "nt" else [cv2.CAP_ANY]
+        for index in indices:
+            for backend in backends:
+                capture = cv2.VideoCapture(index, backend)
+                if capture.isOpened():
+                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    for _ in range(10):                 # some cameras need a few frames
+                        ok, frame = capture.read()
+                        if ok and frame is not None and frame.size:
+                            return capture, f"camera {index} ({capture.getBackendName()})"
+                        time.sleep(0.05)
+                capture.release()
+        return None, ""
+
     def _webcam_loop(self) -> None:
-        index = int(os.environ.get("MIKO_CAMERA_INDEX", "0") or 0)
-        backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-        capture = cv2.VideoCapture(index, backend)
-        if not capture.isOpened():
-            self.error = "webcam_unavailable"
-            self.source = "off"
-            print("MIKO VISION: no webcam found (index", index, ")")
-            self._status()
+        capture = None
+        while not self._stop.is_set():
+            capture, description = self.open_webcam()
+            if capture is not None:
+                break
+            # Busy (another app uses it), blocked by Windows privacy settings,
+            # or unplugged: say so, then keep trying quietly.
+            if self.error != "webcam_unavailable":
+                self.error = "webcam_unavailable"
+                self.source = "off"
+                print("MIKO VISION: no webcam image (busy, blocked in Windows camera privacy settings, or missing); retrying")
+                self._status()
+            self._stop.wait(15)
+        if capture is None:
             return
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.source = "webcam"
         self.error = ""
         self._status()
-        print("MIKO VISION: webcam on, frames stay in memory on this computer")
+        print("MIKO VISION: webcam on,", description, "- frames stay in memory on this computer")
+        failures = 0
         try:
             next_at = 0.0
             while not self._stop.is_set():
                 ok, frame = capture.read()
                 if not ok:
+                    failures += 1
+                    if failures > 50:                   # camera went away: reopen
+                        break
                     time.sleep(0.2)
                     continue
+                failures = 0
                 # A paired device camera takes over while it streams.
                 if time.monotonic() - self._device_frames_at < 2.0:
                     continue
@@ -385,6 +418,9 @@ class VisionService:
             capture.release()
             if self.source == "webcam":
                 self.source = "off"
+        if not self._stop.is_set():
+            self._thread = None
+            self._start_webcam()
 
     def feed_jpeg(self, jpeg: bytes) -> None:
         """Frame from the paired device camera (in memory only)."""
