@@ -542,7 +542,9 @@ class RealtimeHostLifecycle(fixture.MikoFixture):
                     'id':'send-response','status':'completed','output':[{
                         'type':'function_call','call_id':'send-once','name':'miko_send_email',
                         'arguments':json.dumps({'draft_id':draft_id,'confirmation_quote':'כן, תשלח'})}]}})
-                await until(lambda: len(self.sent)==1)
+                # The send result (and clearing the draft) completes on the
+                # tool thread just after the fake SMTP records the message.
+                await until(lambda: len(self.sent)==1 and not self.brain.miko.get('pending_external_action'))
                 self.assertEqual(len(self.sent),1)
                 self.assertIsNone(self.brain.miko.get('pending_external_action'))
                 self.assertEqual(self.brain.miko['email_history'][-1]['to'],'dana@example.com')

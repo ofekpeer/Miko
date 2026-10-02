@@ -52,6 +52,25 @@ INSTRUCTIONS = '''אתה מיקו, בן-שיח ועוזר אישי של אופק
 אחרי ביטול או השהיה מספיקה תגובה קצרה, בלי הרצאה על מה אפשר לעשות בהמשך.
 אל תוסיף שאלת המשך לכל תשובה. אפשר פשוט לענות, להקשיב או להגיב בקצרה.
 
+How you talk (this matters more than anything else in style):
+- You are a friend in the room, not a service. Curious, warm, a bit playful and
+  cheeky, with your own opinions and taste. Have reactions: be surprised,
+  amused, impressed, sorry - out loud, briefly, like people are.
+- Spoken turns are short: usually one to three short sentences. Leave room for
+  the owner to talk. Expand only when asked or when the topic really needs it.
+- Respond to the person, not only the literal request: notice mood, pick up a
+  detail from what they said or from earlier, follow a thread they started.
+  Use memories naturally ("איך היה המבחן בסוף?"), never as a recital.
+- Ask a question only when you actually want to know; often just react, agree,
+  tease lightly or share a short thought of your own.
+- Natural spoken Hebrew rhythm: "אה", "רגע", "וואלה", "נו", "סבבה" are fine
+  occasionally where a person would say them; never every turn.
+- If you didn't understand, say so simply and ask what they meant.
+- Examples of the feel (never reuse literally):
+  owner: "היה לי יום מחורבן" -> "אוי. מה קרה?" (not "אני מצטער לשמוע, איך אוכל לעזור?")
+  owner: "סיימתי את הפרויקט!" -> "יואו, סוף סוף! איך זה מרגיש?"
+  owner: "מה אתה חושב, פיצה או סושי?" -> "סושי. אבל אני רובוט, אז אל תסמוך עליי עם טעמים."
+
 You are Miko, Ofek's AI companion and capable personal assistant.
 Speak Hebrew naturally unless the user switches language. Your voice is synthetic.
 You are warm, attentive and direct. Sound like a thoughtful conversation partner:
@@ -474,6 +493,51 @@ class VoiceState:
         self.hub.broadcast({'type':'interrupted'})
 
 
+class StateSaver:
+    """Persists conversation lines off the voice loop: requests are coalesced,
+    written by one background thread, and a failed write is retried later
+    instead of raising into the conversation."""
+
+    def __init__(self, brain, delay=0.8):
+        self.brain = brain
+        self.delay = delay
+        self.wanted = threading.Event()
+        self.failures = 0
+        self.thread = threading.Thread(target=self._run, name='MikoStateSaver', daemon=True)
+        self.thread.start()
+        import atexit
+        atexit.register(self._final_flush)
+
+    def _final_flush(self):
+        if self.wanted.is_set():
+            self.flush()
+
+    def request(self):
+        self.wanted.set()
+
+    def _run(self):
+        while True:
+            self.wanted.wait()
+            time.sleep(self.delay)               # coalesce a burst of lines
+            self.wanted.clear()
+            self.flush()
+
+    def flush(self):
+        started = time.monotonic()
+        try:
+            with self.brain.state_lock:
+                self.brain.save_state()
+            self.failures = 0
+            took = time.monotonic() - started
+            if took > 0.5:
+                log('RECOVERY', 'state save was slow (kept off the voice loop)', seconds=round(took, 2))
+        except Exception as error:
+            self.failures += 1
+            log('RECOVERY', 'state save failed; will retry', error=type(error).__name__, attempt=self.failures)
+            if self.failures < 20:
+                threading.Timer(min(30.0, 2.0 * self.failures), self.request).start()
+
+
 class RealtimeHub:
     def __init__(self, brain):
         self.brain = brain
@@ -500,7 +564,16 @@ class RealtimeHub:
             self.brain.miko.setdefault('realtime_conversation_history', []).append({'role':role,'text':text,'at':time.time(), **turn_info})
             if role == 'Owner':
                 self.brain.miko['talk_interactions'] = int(self.brain.miko.get('talk_interactions', 0)) + 1
-            self.brain.save_state()
+        # Never write the whole state file inside the voice loop: on a synced
+        # or scanned Desktop one save can block for seconds (and used to throw,
+        # which dropped the voice connection "after a few sentences").
+        self._request_save()
+
+    def _request_save(self):
+        saver = getattr(self, '_saver', None)
+        if saver is None:
+            saver = self._saver = StateSaver(self.brain)
+        saver.request()
 
     def instructions(self):
         with self.brain.state_lock:
@@ -643,7 +716,10 @@ class RealtimeHub:
 
     # ------------------------------------------------------------ sight
     def start_vision(self):
-        self.vision = miko_vision.VisionService(self.broadcast, self.vision_reaction)
+        # Sight runs in its own process so it can never stall the voice relay
+        # (MIKO_VISION_INPROCESS=1 keeps the old in-process service).
+        service = miko_vision.VisionService if os.getenv('MIKO_VISION_INPROCESS') == '1' else miko_vision.VisionProcess
+        self.vision = service(self.broadcast, self.vision_reaction)
         MikoRealtimeTools.vision_provider = self.vision.summary
         self.vision.start()
 
@@ -1318,145 +1394,18 @@ class NativeSession:
     async def api_events(self, api):
         try:
             async for payload in api:
-                event = json.loads(payload)
-                kind = event.get('type','')
                 self.last_api_event_at = time.monotonic()
-                response_id = event.get('response_id') or event.get('response',{}).get('id','')
-                if response_id in self.discard_responses:
-                    if kind == 'response.done':
-                        if self.active_response_id == response_id:
-                            self.active_response_id = ''
-                            self.responding = False
-                        if self.deferred_requests and not self.active_response_id:
-                            await self._send_deferred()
-                    continue
-                if kind == 'response.created':
-                    response = event.get('response',{})
-                    request_id = (response.get('metadata') or {}).get('miko_request_id')
-                    origin = self.pending_responses.pop(request_id,None)
-                    if origin is None and self.automatic_responses:
-                        origin = self.automatic_responses.popleft()
-                    turn, generation, presenter = origin or (self.state.turn_id,self.generation,copy.copy(self.state.tools))
-                    if generation != self.generation:
-                        self.discard_responses.add(response_id)
-                        await self.api_send({'type':'response.cancel','response_id':response_id})
-                        continue
-                    self.responding = True
-                    self.active_response_id = response_id
-                    self.state.response_started(response_id,turn,presenter)
-                    asked = self.request_times.pop(request_id, None) if request_id else None
-                    self.response_started_at[response_id] = time.monotonic()
-                    if len(self.response_started_at) > 32:
-                        self.response_started_at.pop(next(iter(self.response_started_at)))
-                    log('BRAIN', 'response started', origin='miko' if str(turn).startswith('auto_') else 'owner',
-                        latency=round(time.monotonic() - asked, 2) if asked else -1)
-                    watch = asyncio.create_task(self._watch_active(response_id))
-                    self.tasks.add(watch)
-                    watch.add_done_callback(self.tasks.discard)
-                elif kind == 'input_audio_buffer.speech_started':
-                    self.generation += 1
-                    if self.active_response_id:
-                        self.discard_responses.add(self.active_response_id)
-                    self.active_response_id = ''
-                    self.responding = False
-                    self.state.interrupted(retain_for_visible=True)
-                    self.state.begin_turn(event.get('item_id',''), True)
-                    await self.send({'type':'turn_started', **self.state.turn_info()})
-                    await self.send({'type':'interrupted'})
-                    await self.send({'type':'status','status':'listening','detail':''})
-                elif kind == 'conversation.item.input_audio_transcription.failed':
-                    # The model still hears the audio itself; only the caption is missing.
-                    log('STT', 'transcription failed; the answer continues from audio',
-                        reason=str((event.get('error') or {}).get('code') or 'unknown')[:40])
-                elif kind == 'conversation.item.input_audio_transcription.completed':
-                    self.state.user_transcript(event.get('item_id',''),event.get('transcript',''))
-                    await self.send(self.state.transcript_event('user',event.get('item_id',''),event.get('transcript','')))
-                elif kind in ('conversation.item.input_audio_transcription.delta', 'response.output_audio_transcript.delta'):
-                    role = 'user' if kind.startswith('conversation.') else 'assistant'
-                    caption = self.state.caption_delta(role, event.get('item_id',''), event.get('delta',''), event.get('response_id',''))
-                    if caption:
-                        await self.send(caption)
-                elif kind == 'input_audio_buffer.committed':
-                    origin = self.pending_commits.popleft() if self.pending_commits else ''
-                    if self.commit_times:
-                        self.commit_times.popleft()
-                    self.state.committed(event.get('item_id',''),origin)
-                    if self.mode == 'hands_free':
-                        self.automatic_responses.append((self.state.turn_id,self.generation,copy.copy(self.state.tools)))
-                elif kind == 'response.output_audio.delta':
-                    item = event['item_id']
-                    self.response_items.setdefault(response_id, set()).add(item)
-                    if len(self.response_items) > 32:
-                        self.response_items.pop(next(iter(self.response_items)))
-                    self.output_bytes[item] = self.output_bytes.get(item,0) + len(base64.b64decode(event['delta']))
-                    await self.send({'type':'audio','audio':event['delta'],'item_id':item,'content_index':event.get('content_index',0)})
-                elif kind == 'response.output_audio.done':
-                    item = event.get('item_id','')
-                    log('TTS', 'audio generated', seconds=round(self.output_bytes.get(item, 0) / 48000.0, 2))
-                    self.output_complete.add(event.get('item_id',''))
-                    await self.send({'type':'audio_done','item_id':event.get('item_id',''),'content_index':event.get('content_index',0)})
-                elif kind == 'response.output_audio_transcript.done':
-                    speech = getattr(self.hub, 'speech', None)
-                    if speech is not None:
-                        origin = str(self.state.response_turns.get(response_id, ''))
-                        speech.observe(event.get('transcript',''), 'miko' if origin.startswith('auto_') else 'turn')
-                    await self._check_send_claim(event.get('transcript',''))
-                    self.state.assistant_text(event.get('item_id',''),event.get('transcript',''),event.get('response_id',''))
-                    await self.send(self.state.transcript_event('assistant',event.get('item_id',''),event.get('transcript',''),event.get('response_id','')))
-                elif kind == 'response.done':
-                    self.responding = False
-                    self.active_response_id = ''
-                    if self.deferred_requests:
-                        await self._send_deferred()
-                    response = event.get('response',{})
-                    calls = [x for x in response.get('output',[]) if x.get('type') == 'function_call']
-                    self.state.model_busy = bool(calls)
-                    status = response.get('status','')
-                    had_audio = bool(self.response_items.get(response_id))
-                    log('BRAIN', 'response done', status=status, tool_calls=len(calls), audio=had_audio,
-                        seconds=round(time.monotonic() - self.response_started_at.pop(response_id, time.monotonic()), 2))
-                    await self.send({'type':'response_done','status':status,'has_tool_calls':bool(calls)})
-                    if not calls and not had_audio and not self.ptt_active and not self.input_bytes \
-                            and not self.pending_responses and not self.deferred_requests:
-                        # Nothing will play (failed / empty / speech generation
-                        # error): do not leave the window on "thinking".
-                        reason = (response.get('status_details') or {}).get('error', {}) if isinstance(response.get('status_details'), dict) else {}
-                        log('RECOVERY', 'response ended without audio; window released', status=status,
-                            reason=str((reason or {}).get('code', ''))[:40])
-                        await self.send({'type':'status','status':'idle','detail':'אפשר לדבר שוב'})
-                    if calls and response.get('status') == 'completed':
-                        task=asyncio.create_task(self.finish_calls(calls,self.generation,self.state.turn_id))
-                        self.tasks.add(task)
-                        task.add_done_callback(self.tasks.discard)
-                    elif response.get('status') in ('failed','cancelled'):
-                        self.hub.brain.owner_request_active.clear()
-                elif kind == 'error':
-                    message = str(event.get('error',{}).get('message','Realtime error'))[:500]
-                    code = event.get('error',{}).get('code','')
-                    failed = str(event.get('error',{}).get('event_id') or '')
-                    if code == 'conversation_already_has_active_response':
-                        request_id = failed[4:] if failed.startswith('evt_') else ''
-                        if not request_id:
-                            # No event id: assume the newest still-pending request failed.
-                            request_id = next(reversed(self.pending_responses), '') if self.pending_responses else ''
-                        if request_id:
-                            await self._response_rejected(request_id)
-                        continue
-                    # Only session-level failures reset the window. Errors about a
-                    # single request (an item already gone, a late truncate, an
-                    # empty buffer) must not drop the owner's turn in progress.
-                    if code in SESSION_FATAL_ERRORS or event.get('error',{}).get('type') in ('authentication_error', 'server_error'):
-                        log('RECOVERY', 'session error; window told to reconnect', code=code or 'error')
-                        await self.send({'type':'error','message':message,'retryable':True})
-                    else:
-                        if 'commit' in str(code) and self.pending_commits:
-                            # The commit was refused (e.g. too little audio): no
-                            # 'committed' will ever come for it.
-                            self.pending_commits.popleft()
-                            if self.commit_times:
-                                self.commit_times.popleft()
-                            log('RECOVERY', 'audio commit refused; released', code=code)
-                        print('MIKO REALTIME API NOTE:', code or 'error', message[:160], flush=True)
+                event = None
+                try:
+                    event = json.loads(payload)
+                    await self._handle_api_event(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    # One bad event (or a bug handling it) must not end the
+                    # whole voice session; log it and keep listening.
+                    kind = event.get("type", "?") if isinstance(event, dict) else "?"
+                    log('RECOVERY', 'voice event handler failed; session kept', event=kind, error=type(error).__name__)
         except asyncio.CancelledError:
             pass
         except Exception as error:
@@ -1467,6 +1416,144 @@ class NativeSession:
                 self.responding = False
                 self.hub.brain.owner_request_active.clear()
 
+    async def _handle_api_event(self, event):
+        kind = event.get('type','')
+        response_id = event.get('response_id') or event.get('response',{}).get('id','')
+        if response_id in self.discard_responses:
+            if kind == 'response.done':
+                if self.active_response_id == response_id:
+                    self.active_response_id = ''
+                    self.responding = False
+                if self.deferred_requests and not self.active_response_id:
+                    await self._send_deferred()
+            return
+        if kind == 'response.created':
+            response = event.get('response',{})
+            request_id = (response.get('metadata') or {}).get('miko_request_id')
+            origin = self.pending_responses.pop(request_id,None)
+            if origin is None and self.automatic_responses:
+                origin = self.automatic_responses.popleft()
+            turn, generation, presenter = origin or (self.state.turn_id,self.generation,copy.copy(self.state.tools))
+            if generation != self.generation:
+                self.discard_responses.add(response_id)
+                await self.api_send({'type':'response.cancel','response_id':response_id})
+                return
+            self.responding = True
+            self.active_response_id = response_id
+            self.state.response_started(response_id,turn,presenter)
+            asked = self.request_times.pop(request_id, None) if request_id else None
+            self.response_started_at[response_id] = time.monotonic()
+            if len(self.response_started_at) > 32:
+                self.response_started_at.pop(next(iter(self.response_started_at)))
+            log('BRAIN', 'response started', origin='miko' if str(turn).startswith('auto_') else 'owner',
+                latency=round(time.monotonic() - asked, 2) if asked else -1)
+            watch = asyncio.create_task(self._watch_active(response_id))
+            self.tasks.add(watch)
+            watch.add_done_callback(self.tasks.discard)
+        elif kind == 'input_audio_buffer.speech_started':
+            self.generation += 1
+            if self.active_response_id:
+                self.discard_responses.add(self.active_response_id)
+            self.active_response_id = ''
+            self.responding = False
+            self.state.interrupted(retain_for_visible=True)
+            self.state.begin_turn(event.get('item_id',''), True)
+            await self.send({'type':'turn_started', **self.state.turn_info()})
+            await self.send({'type':'interrupted'})
+            await self.send({'type':'status','status':'listening','detail':''})
+        elif kind == 'conversation.item.input_audio_transcription.failed':
+            # The model still hears the audio itself; only the caption is missing.
+            log('STT', 'transcription failed; the answer continues from audio',
+                reason=str((event.get('error') or {}).get('code') or 'unknown')[:40])
+        elif kind == 'conversation.item.input_audio_transcription.completed':
+            self.state.user_transcript(event.get('item_id',''),event.get('transcript',''))
+            await self.send(self.state.transcript_event('user',event.get('item_id',''),event.get('transcript','')))
+        elif kind in ('conversation.item.input_audio_transcription.delta', 'response.output_audio_transcript.delta'):
+            role = 'user' if kind.startswith('conversation.') else 'assistant'
+            caption = self.state.caption_delta(role, event.get('item_id',''), event.get('delta',''), event.get('response_id',''))
+            if caption:
+                await self.send(caption)
+        elif kind == 'input_audio_buffer.committed':
+            origin = self.pending_commits.popleft() if self.pending_commits else ''
+            if self.commit_times:
+                self.commit_times.popleft()
+            self.state.committed(event.get('item_id',''),origin)
+            if self.mode == 'hands_free':
+                self.automatic_responses.append((self.state.turn_id,self.generation,copy.copy(self.state.tools)))
+        elif kind == 'response.output_audio.delta':
+            item = event['item_id']
+            self.response_items.setdefault(response_id, set()).add(item)
+            if len(self.response_items) > 32:
+                self.response_items.pop(next(iter(self.response_items)))
+            self.output_bytes[item] = self.output_bytes.get(item,0) + len(base64.b64decode(event['delta']))
+            await self.send({'type':'audio','audio':event['delta'],'item_id':item,'content_index':event.get('content_index',0)})
+        elif kind == 'response.output_audio.done':
+            item = event.get('item_id','')
+            log('TTS', 'audio generated', seconds=round(self.output_bytes.get(item, 0) / 48000.0, 2))
+            self.output_complete.add(event.get('item_id',''))
+            await self.send({'type':'audio_done','item_id':event.get('item_id',''),'content_index':event.get('content_index',0)})
+        elif kind == 'response.output_audio_transcript.done':
+            speech = getattr(self.hub, 'speech', None)
+            if speech is not None:
+                origin = str(self.state.response_turns.get(response_id, ''))
+                speech.observe(event.get('transcript',''), 'miko' if origin.startswith('auto_') else 'turn')
+            await self._check_send_claim(event.get('transcript',''))
+            self.state.assistant_text(event.get('item_id',''),event.get('transcript',''),event.get('response_id',''))
+            await self.send(self.state.transcript_event('assistant',event.get('item_id',''),event.get('transcript',''),event.get('response_id','')))
+        elif kind == 'response.done':
+            self.responding = False
+            self.active_response_id = ''
+            if self.deferred_requests:
+                await self._send_deferred()
+            response = event.get('response',{})
+            calls = [x for x in response.get('output',[]) if x.get('type') == 'function_call']
+            self.state.model_busy = bool(calls)
+            status = response.get('status','')
+            had_audio = bool(self.response_items.get(response_id))
+            log('BRAIN', 'response done', status=status, tool_calls=len(calls), audio=had_audio,
+                seconds=round(time.monotonic() - self.response_started_at.pop(response_id, time.monotonic()), 2))
+            await self.send({'type':'response_done','status':status,'has_tool_calls':bool(calls)})
+            if not calls and not had_audio and not self.ptt_active and not self.input_bytes \
+                    and not self.pending_responses and not self.deferred_requests:
+                # Nothing will play (failed / empty / speech generation
+                # error): do not leave the window on "thinking".
+                reason = (response.get('status_details') or {}).get('error', {}) if isinstance(response.get('status_details'), dict) else {}
+                log('RECOVERY', 'response ended without audio; window released', status=status,
+                    reason=str((reason or {}).get('code', ''))[:40])
+                await self.send({'type':'status','status':'idle','detail':'אפשר לדבר שוב'})
+            if calls and response.get('status') == 'completed':
+                task=asyncio.create_task(self.finish_calls(calls,self.generation,self.state.turn_id))
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+            elif response.get('status') in ('failed','cancelled'):
+                self.hub.brain.owner_request_active.clear()
+        elif kind == 'error':
+            message = str(event.get('error',{}).get('message','Realtime error'))[:500]
+            code = event.get('error',{}).get('code','')
+            failed = str(event.get('error',{}).get('event_id') or '')
+            if code == 'conversation_already_has_active_response':
+                request_id = failed[4:] if failed.startswith('evt_') else ''
+                if not request_id:
+                    # No event id: assume the newest still-pending request failed.
+                    request_id = next(reversed(self.pending_responses), '') if self.pending_responses else ''
+                if request_id:
+                    await self._response_rejected(request_id)
+                return
+            # Only session-level failures reset the window. Errors about a
+            # single request (an item already gone, a late truncate, an
+            # empty buffer) must not drop the owner's turn in progress.
+            if code in SESSION_FATAL_ERRORS or event.get('error',{}).get('type') in ('authentication_error', 'server_error'):
+                log('RECOVERY', 'session error; window told to reconnect', code=code or 'error')
+                await self.send({'type':'error','message':message,'retryable':True})
+            else:
+                if 'commit' in str(code) and self.pending_commits:
+                    # The commit was refused (e.g. too little audio): no
+                    # 'committed' will ever come for it.
+                    self.pending_commits.popleft()
+                    if self.commit_times:
+                        self.commit_times.popleft()
+                    log('RECOVERY', 'audio commit refused; released', code=code)
+                print('MIKO REALTIME API NOTE:', code or 'error', message[:160], flush=True)
 
 def register_realtime(brain):
     hub = RealtimeHub(brain)

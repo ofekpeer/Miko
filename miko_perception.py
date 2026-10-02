@@ -74,6 +74,7 @@ class HandObs:
     openness: float = -1.0        # share of the four fingers extended, -1 unknown
     size: float = 0.0             # wrist -> middle knuckle, relative to frame width
     center: tuple = ()            # palm center (x, y)
+    tips: tuple = ()              # fingertip center (x, y): what swings in a wrist wave
 
 
 @dataclass
@@ -166,7 +167,7 @@ class MediaPipePerception:
                 openness, size, center = _hand_shape(landmarks, aspect)
                 obs.hands.append(HandObs(gesture, score, (landmarks[0].x, landmarks[0].y),
                                          (landmarks[8].x, landmarks[8].y), (landmarks[5].x, landmarks[5].y), handed,
-                                         openness, size, center))
+                                         openness, size, center, _fingertips(landmarks)))
         obs.faces.sort(key=lambda f: -f.w)            # nearest (largest) first
         return obs
 
@@ -190,6 +191,11 @@ def _hand_shape(landmarks, aspect: float = 0.75) -> tuple[float, float, tuple]:
     ids = (0, 5, 9, 13, 17)
     center = (sum(landmarks[i].x for i in ids) / 5.0, sum(landmarks[i].y for i in ids) / 5.0)
     return extended / 4.0, size, center
+
+
+def _fingertips(landmarks) -> tuple:
+    ids = (8, 12, 16, 20)
+    return (sum(landmarks[i].x for i in ids) / 4.0, sum(landmarks[i].y for i in ids) / 4.0)
 
 
 # ---------------------------------------------------------------- analyzers

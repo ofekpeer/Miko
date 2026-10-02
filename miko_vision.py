@@ -122,6 +122,7 @@ class VisionEngine:
         self.seen = False
         self.face: _Face | None = None
         self._raw_face: _Face | None = None
+        self._prev_raw_face: _Face | None = None
         self._smooth: _Face | None = None
         self._streak = 0
         self._last_face_at = -1e9
@@ -140,6 +141,8 @@ class VisionEngine:
         self.hand_wave = WaveDetector("hand")
         self.flow_wave = WaveDetector("flow", can_confirm=self.mp is None)
         self._last_hand: HandSample | None = None
+        self._hand_seen_at = -1e9
+        self._jolt_flip = False
         self._last_motion = -1e9
         self._last_light = -1e9
         self._face_change_at = -1e9
@@ -234,7 +237,7 @@ class VisionEngine:
             self.people = self.crowd.count
         else:
             face = self._pick(detected)
-        self._raw_face = face
+        self._prev_raw_face, self._raw_face = self._raw_face, face
         if (face is not None) != self._had_face:
             self._had_face = face is not None
             self._face_change_at = now
@@ -303,14 +306,15 @@ class VisionEngine:
         if hands:
             # Follow the same hand between frames; else the most certain one.
             def position(h):
-                return h.center if h.center else h.wrist
+                return h.tips if h.tips else (h.center if h.center else h.wrist)
             if self._last_hand is not None:
                 last = self._last_hand
                 hand = min(hands, key=lambda h: (position(h)[0] - last.x) ** 2 + (position(h)[1] - last.y) ** 2)
             else:
                 hand = max(hands, key=lambda h: h.score * max(h.size, 0.05))
-            x, y = position(hand)
+            x, y = hand.tips if hand.tips else position(hand)
             sample = HandSample(now, float(x), float(y), float(hand.size or 0.1), float(hand.openness), hand.gesture)
+            self._hand_seen_at = now
         self._last_hand = sample
         return [self._event(now, e.pop("event"), **e)
                 for e in self.hand_wave.update(now, sample, self._face_sample(now), stable)]
@@ -424,58 +428,73 @@ class VisionEngine:
         widened to the shoulders and everything below it (the body)."""
         H, W = shape
         mask = np.ones((H, W), np.float32)
-        # Both the raw detection and the smoothed track: a fast head lags
-        # the smoothed box.
-        for f in (self.face if self.seen else None, self._raw_face):
+        # The raw detection now and one frame ago (the diff compares both
+        # frames) plus the smoothed track: a fast head lags the smoothed box.
+        for f in (self.face if self.seen else None, self._raw_face, self._prev_raw_face):
             if f is None:
                 continue
-            x0, x1 = int((f.cx - 1.2 * f.w) * W), int((f.cx + 1.2 * f.w) * W)
-            y0 = int((f.cy - 1.0 * f.h) * H)
+            # Detectors box the inner face; hair, ears and shoulders reach
+            # well beyond it.
+            x0, x1 = int((f.cx - 1.4 * f.w) * W), int((f.cx + 1.4 * f.w) * W)
+            y0 = int((f.cy - 1.6 * f.h) * H)
             mask[max(0, y0):, max(0, x0):max(0, x1)] = 0.0
         return mask
 
     def _global_motion(self, prev, gray) -> tuple[tuple[float, float], float]:
         """How far the room moved since the last frame (camera or device
-        motion), and how much to trust it (0..1). Measured on the background
-        only: a head moving in front of a plain wall, or a hand moving over a
-        still room, is not the camera moving."""
+        motion), and how much to trust it (0..1).
+
+        Measured on the background only (the person is masked) and checked
+        zone by zone: when the camera moves, the left, right and top parts of
+        the room all move the same way; a head moving in front of a plain
+        wall, or a hand over a still room, changes only the area next to it.
+        A fast shake blurs everything, so "most zones changed at once with
+        steady brightness" also counts, with an uncertain direction."""
         H, W = gray.shape
         if self._hann is None or self._hann.shape != gray.shape:
             self._hann = cv2.createHanningWindow((W, H), cv2.CV_32F)
         mask = self._background_mask(gray.shape)
-        share = float(mask.mean())
-        if share < 0.25:
-            return (0.0, 0.0), 0.0                 # the person fills the view: unknowable
         room = mask > 0.5
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        textured = float((cv2.magnitude(gx, gy)[room] > 24.0).mean())
-        if textured < 0.06:
-            return (0.0, 0.0), 0.0                 # featureless background (plain wall): unknowable
+        if float(room.mean()) < 0.15:
+            return (0.0, 0.0), 0.0                 # the person fills the view: unknowable
+        zones = []
+        for zone in (np.s_[:, : W // 3], np.s_[:, 2 * W // 3:], np.s_[: H // 3, W // 4: 3 * W // 4]):
+            z = np.zeros_like(room)
+            z[zone] = True
+            z &= room
+            if float(z.mean()) >= 0.03:
+                zones.append(z)
+        if len(zones) < 2:
+            return (0.0, 0.0), 0.0
+        diff = cv2.absdiff(prev, gray).astype(np.float32)
         window = self._hann * cv2.blur(mask, (9, 9))
         (sx, sy), response = cv2.phaseCorrelate(prev.astype(np.float32), gray.astype(np.float32), window)
         shift = math.hypot(sx, sy)
-        if shift < 0.5:
-            return (0.0, 0.0), 0.0
-        # Does shifting the whole previous frame explain the new one (on the
-        # background)? It does when the camera moved; it does not when only
-        # something in front of a still room moved.
-        m = max(2, int(math.ceil(shift)) + 2)
-        if 2 * m >= min(H, W):
-            return (0.0, 0.0), 0.0
-        inner = room[m:-m, m:-m]
-        if not inner.any():
-            return (0.0, 0.0), 0.0
-        diff = cv2.absdiff(prev, gray)
-        raw = float(diff[m:-m, m:-m][inner].mean())
-        if response > 0.08:
+        if shift >= 0.5 and response > 0.04 and shift < min(H, W) / 4:
             moved = cv2.warpAffine(prev, np.float32([[1, 0, sx], [0, 1, sy]]), (W, H), borderMode=cv2.BORDER_REPLICATE)
-            aligned = float(cv2.absdiff(moved, gray)[m:-m, m:-m][inner].mean())
-            if raw > 2.0 and aligned < 0.6 * raw:
+            aligned = cv2.absdiff(moved, gray).astype(np.float32)
+            m = int(math.ceil(shift)) + 2
+            edge = np.zeros_like(room)
+            edge[m:-m, m:-m] = True
+            agreeing = 0
+            for z in zones:
+                zz = z & edge
+                if not zz.any():
+                    continue
+                raw = float(diff[zz].mean())
+                if raw > 1.0 and float(aligned[zz].mean()) < 0.7 * raw:
+                    agreeing += 1
+            if agreeing >= 2:
                 return (sx, sy), 1.0
-        # A fast move blurs the image so phase correlation cannot lock on; if
-        # nearly the whole room changed at once, it was the camera.
-        if float((diff[room] > 25).mean()) > 0.55:
+        # Blur: most zones changed a lot at once while the brightness stayed
+        # (a light switching or the lens being covered changes brightness).
+        if abs(float(gray.mean()) - float(prev.mean())) > 12.0 or float(gray.std()) < 10.0 or float(prev.std()) < 10.0:
+            return (0.0, 0.0), 0.0
+        busy = sum(1 for z in zones if float(diff[z].mean()) > 4.0)
+        if busy >= 2 and busy >= len(zones) - 1:
+            if shift < 0.5:
+                sx, sy = (3.0, 0.0) if self._jolt_flip else (-3.0, 0.0)
+                self._jolt_flip = not self._jolt_flip
             return (sx, sy), 0.6
         return (0.0, 0.0), 0.0
 
@@ -545,6 +564,9 @@ class VisionEngine:
                         if abs(vx) > 0.9 * vy:            # mostly sideways
                             bx, by = float(centers[index][0]) / W, float(centers[index][1]) / H
                             sample = HandSample(now, bx, by, 0.1, -1.0, "", bx)
+        # Fast waves blur, and the hand model then loses the hand: flow may
+        # confirm when there is no hand model, or a hand was seen just now.
+        self.flow_wave.can_confirm = self.mp is None or now - self._hand_seen_at < 2.5
         events = self.flow_wave.update(now, sample, self._face_sample(now), camera_stable=True)
         for event in events:
             out.append(self._event(now, event.pop("event"), **event))
@@ -818,3 +840,150 @@ class VisionService:
             self._last_state_at = now
             self._last_state = state
             self.emit(state)
+
+
+class VisionProcess:
+    """Same interface as VisionService, but the camera, OpenCV and MediaPipe
+    run in a separate process (miko_vision_worker.py), so perception can never
+    starve the real-time voice relay. The worker is restarted if it dies.
+    Perception events still pass through ``react`` here first (the response
+    level is decided in the host), then go to Godot via ``emit``."""
+
+    WORKER = os.path.join(BASE_DIR, "miko_vision_worker.py")
+
+    def __init__(self, emit: Callable[[dict], None], react: Callable[[dict], None] | None = None,
+                 settings_path: str = SETTINGS_PATH) -> None:
+        self.emit = emit
+        self.react = react
+        self.settings_path = settings_path
+        self.enabled = VisionService._load_enabled(self)
+        self.source = "off"
+        self.error = ""
+        self.engine = None                      # lives in the worker
+        self._proc = None
+        self._write_lock = threading.Lock()
+        self._stopping = False
+        self._summary: dict[str, Any] = {"status": "watching", "seen": False}
+        self._imu: ImuInterpreter | None = None
+        self._restarts = 0
+
+    # ------------------------------------------------------------ process
+    def start(self) -> None:
+        if not available():
+            self.error = "opencv_missing"
+            print("MIKO VISION: OpenCV not installed (pip install opencv-python) - sight disabled")
+            self.emit(self.status_event())
+            return
+        self._stopping = False
+        self._spawn()
+
+    def _spawn(self) -> None:
+        import subprocess
+        import sys
+        env = dict(os.environ, MIKO_LOG_STDERR="1", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        self._proc = subprocess.Popen([sys.executable, "-X", "utf8", self.WORKER], cwd=BASE_DIR, env=env,
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+                                      text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                      creationflags=flags)
+        log("PERCEPTION", "vision worker started", pid=self._proc.pid)
+        threading.Thread(target=self._read, args=(self._proc,), name="MikoVisionReader", daemon=True).start()
+
+    def _read(self, proc) -> None:
+        for line in proc.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            kind, body = message.get("t"), message.get("m") or {}
+            try:
+                if kind == "event":
+                    if self.react:
+                        self.react(body)            # annotates the response level
+                    self.emit(body)
+                elif kind == "emit":
+                    if body.get("type") == "vision_status":
+                        self.enabled = bool(body.get("enabled", self.enabled))
+                        self.source = str(body.get("source", self.source))
+                        self.error = str(body.get("error", ""))
+                    self.emit(body)
+                elif kind == "summary":
+                    self._summary = body
+            except Exception as error:              # never let a reaction kill the reader
+                log("RECOVERY", "vision message failed", kind=kind, error=type(error).__name__)
+        code = proc.wait()
+        if self._stopping or proc is not self._proc:
+            return
+        self._restarts += 1
+        delay = min(30.0, 2.0 * self._restarts)
+        log("RECOVERY", "vision worker exited; restarting", code=code, delay=delay, count=self._restarts)
+        self.source = "off"
+        self.emit(self.status_event())
+        time.sleep(delay)
+        if not self._stopping:
+            self._spawn()
+
+    def _send(self, command: dict) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        with self._write_lock:
+            try:
+                proc.stdin.write(json.dumps(command) + "\n")
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def stop(self) -> None:
+        self._stopping = True
+        proc = self._proc
+        if proc is None:
+            return
+        self._send({"c": "stop"})
+        try:
+            proc.wait(timeout=4)
+        except Exception:
+            proc.kill()
+        self.source = "off"
+
+    # ------------------------------------------------------------ interface
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._send({"c": "enable", "v": self.enabled})
+        if not self.enabled:
+            self.emit({"type": "vision", "seen": False})
+
+    def status_event(self) -> dict[str, Any]:
+        return {"type": "vision_status", "enabled": self.enabled, "source": self.source,
+                "available": available(), "error": self.error}
+
+    def summary(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"status": "camera_off", "seen": False}
+        return dict(self._summary)
+
+    def feed_jpeg(self, jpeg: bytes) -> None:
+        if self.enabled:
+            import base64
+            self._send({"c": "jpeg", "b": base64.b64encode(jpeg).decode("ascii")})
+
+    def feed_imu(self, samples, now: float | None = None) -> None:
+        if self._imu is None:
+            self._imu = ImuInterpreter()
+            log("PHYSICAL", "device IMU connected; it is now the shake source")
+        events: list[dict[str, Any]] = []
+        last_t = None
+        for sample in samples:
+            events.extend(self._imu.update(sample))
+            last_t = float(sample[0])
+        if last_t is not None:
+            self._send({"c": "imu", "active": 2.0, "unstable": 0.0 if self._imu.detector.stable(last_t) else 0.3})
+        for event in events:
+            message = {"type": "vision_event", **event}
+            log("PERCEPTION", "event " + str(event.get("event")), source="imu")
+            if self.react:
+                try:
+                    self.react(message)
+                except Exception as error:
+                    log("RECOVERY", "vision reaction failed", error=type(error).__name__)
+            self.emit(message)

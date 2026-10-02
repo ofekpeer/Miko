@@ -17,6 +17,8 @@ import threading
 import time
 
 DEBUG = os.environ.get("MIKO_VISION_DEBUG", "").strip() == "1"
+# The vision worker process uses stdout for its protocol; its logs go to stderr.
+_STREAM = sys.stderr if os.environ.get("MIKO_LOG_STDERR", "").strip() == "1" else None
 _lock = threading.Lock()
 _last: dict[str, float] = {}
 
@@ -34,11 +36,12 @@ def log(category: str, message: str, **fields) -> None:
     line = f"{stamp} {category}: {message}" + (f" {extra}" if extra else "")
     with _lock:
         try:
-            print(line, flush=True)
+            print(line, flush=True, file=_STREAM or sys.stdout)
         except Exception:
             try:
-                sys.stdout.buffer.write((line + "\n").encode("utf-8", "replace"))
-                sys.stdout.flush()
+                stream = _STREAM or sys.stdout
+                stream.buffer.write((line + "\n").encode("utf-8", "replace"))
+                stream.flush()
             except Exception:
                 pass
 

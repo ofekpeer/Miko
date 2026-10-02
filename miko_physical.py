@@ -73,6 +73,7 @@ class _Episode:
     previous: list = field(default_factory=lambda: [0.0, 0.0, 0.0])   # last completed half-swing
     swings: int = 0               # sustained reversals (strong both ways)
     swing_times: list = field(default_factory=list)
+    jolts: list = field(default_factory=list)       # (t, sign) of blurred, direction-uncertain frames
     weak_swings: int = 0
     shaking: bool = False
     last_active: float = 0.0
@@ -156,9 +157,18 @@ class PhysicalInteractionDetector:
             ep.signs[axis] = sign
 
         duration = t - ep.started
+        if quality < 1.0 and magnitude >= self.p.reversal * gain:
+            axis = 0 if abs(vec[0]) >= abs(vec[1]) else 1
+            ep.jolts.append((t, 1 if vec[axis] >= 0 else -1))
         brisk = sum(1 for st in ep.swing_times if t - st <= self.p.shake_window)
-        if not ep.shaking and brisk >= self.p.shake_swings and duration >= self.p.shake_min_duration \
-                and ep.peak >= self.p.shake_peak * gain:
+        # A real shake blurs the picture; many blurred jolts with changing
+        # direction inside the window are a shake even when swings cannot be
+        # measured cleanly.
+        recent = [sign for jt, sign in ep.jolts if t - jt <= self.p.shake_window]
+        flips = sum(1 for a, b in zip(recent, recent[1:]) if a != b)
+        blurry_shake = len(recent) >= 6 and (flips >= 2 or len(recent) >= 9)
+        if not ep.shaking and (brisk >= self.p.shake_swings or blurry_shake) \
+                and duration >= self.p.shake_min_duration and ep.peak >= self.p.shake_peak * gain * (0.6 if blurry_shake else 1.0):
             ep.shaking = True
             ep.last_active = t
             confidence = self._shake_confidence(ep, duration, gain)

@@ -162,6 +162,14 @@ class WaveEvidence(unittest.TestCase):
         self.assertGreaterEqual(events[0]["confidence"], CONFIRM)
         self.assertEqual(events[0]["hand"], "left")             # image right = the owner's left
 
+    def test_G_a_short_clear_hi_wave_counts(self):
+        d = WaveDetector("hand")
+        events = wave_frames(d, 0.8, hz=1.8)                     # left-right-left, open raised hand
+        self.assertEqual([e["event"] for e in events], ["wave"], d.last_evidence)
+
+    def test_two_swings_of_a_half_open_hand_do_not_count(self):
+        self.assertEqual(wave_frames(WaveDetector("hand"), 0.8, hz=1.8, openness=0.5), [])
+
     def test_G_a_wave_with_tracking_dropouts_still_counts(self):
         d = WaveDetector("hand")
         events = wave_frames(d, 2.0, present=lambda i: i % 4 != 0)
@@ -278,6 +286,22 @@ class CameraScenes(unittest.TestCase):
         frames = [wall(int(240 + 22 * math.sin(2 * math.pi * 2.5 * i / 15.0))) for i in range(45)]
         events = self.run_frames(engine, frames, start=1.0)
         self.assertEqual([e for e in events if e.startswith(("shake", "device"))], [], events)
+
+    def test_B_a_real_blurred_laptop_shake_is_one_shake(self):
+        import numpy as np
+        import cv2
+        for engine in self.engines():
+            base = self.tv.frame()
+            self.run_frames(engine, [base] * 6)
+            frames = []
+            for i in range(24):                                      # ~1.6 s at 15 fps, 4 Hz shake
+                dx = int(36 * math.sin(2 * math.pi * 4.0 * i / 15.0))
+                moved = np.roll(base, dx, axis=1)
+                k = max(3, abs(int(36 * math.cos(2 * math.pi * 4.0 * i / 15.0))) // 2 * 2 + 1)
+                frames.append(cv2.blur(moved, (k, 3)))               # motion blur, like a real webcam
+            events = self.run_frames(engine, frames + [base] * 30, start=1.0)
+            self.assertEqual(events.count("shake_started"), 1, events)
+            self.assertNotIn("wave", events)
 
     def test_A_still_camera_with_noise_gives_no_physical_events(self):
         import numpy as np

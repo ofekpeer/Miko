@@ -33,6 +33,16 @@ HAND = cv2.GaussianBlur(HAND, (5, 5), 0)
 # lets the engine tell a moving camera from a moving hand.
 _ROOM = cv2.GaussianBlur(RNG.integers(40, 170, (480, 640, 3)).astype(np.uint8), (0, 0), 1.5)
 _ROOM = cv2.addWeighted(_ROOM, 0.6, np.full_like(_ROOM, (92, 104, 112)), 0.4, 0)
+# Furniture-like structure (shelves, frames, a door edge): real rooms have
+# edges that survive downscaling, which is what camera-motion checks rely on.
+for _x, _y, _w, _h, _c in [(10, 20, 120, 40, (40, 60, 90)), (500, 30, 110, 150, (200, 190, 170)),
+                            (20, 300, 90, 160, (60, 40, 30)), (530, 330, 90, 120, (30, 90, 60)),
+                            (150, 10, 60, 90, (180, 200, 210)), (460, 220, 40, 80, (20, 20, 30)),
+                            (5, 150, 70, 60, (150, 120, 60)), (580, 200, 50, 90, (210, 210, 220))]:
+    cv2.rectangle(_ROOM, (_x, _y), (_x + _w, _y + _h), _c, -1)
+    cv2.rectangle(_ROOM, (_x, _y), (_x + _w, _y + _h), (15, 15, 15), 3)
+for _y in (120, 260, 420):
+    cv2.line(_ROOM, (0, _y), (640, _y + 6), (35, 30, 25), 4)
 
 
 def frame(face_x=240, hand=None):
@@ -185,6 +195,50 @@ class VisionTests(unittest.TestCase):
         ok, jpeg = cv2.imencode(".jpg", frame(), [cv2.IMWRITE_JPEG_QUALITY, 70])
         service.feed_jpeg(jpeg.tobytes())
         self.assertEqual(service.source, "device")
+
+
+class VisionProcessTests(unittest.TestCase):
+    """Sight in its own process: events still reach the host's reaction
+    first, state reaches Godot, and a crashed worker is restarted."""
+
+    def wait(self, predicate, seconds=40.0):
+        import time
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_device_frames_through_the_worker_process(self):
+        import os
+        import time
+        emitted, reactions = [], []
+
+        def react(message):
+            message["level"] = "SHORT_VOCAL"      # the host annotates before Godot sees it
+            reactions.append(dict(message))
+        service = miko_vision.VisionProcess(emitted.append, react, settings_path="/nonexistent/x.json")
+        os.environ["MIKO_CAMERA_INDEX"] = "99"      # no webcam in tests
+        service.start()
+        try:
+            self.assertTrue(self.wait(lambda: any(e.get("type") == "vision_status" for e in emitted)))
+            ok, jpeg = cv2.imencode(".jpg", frame(), [cv2.IMWRITE_JPEG_QUALITY, 80])
+            for _ in range(40):
+                service.feed_jpeg(jpeg.tobytes())
+                time.sleep(0.07)
+            self.assertTrue(self.wait(lambda: [r["event"] for r in reactions] == ["arrived"]), reactions)
+            godot = [e for e in emitted if e.get("type") == "vision_event"]
+            self.assertEqual(godot[0].get("level"), "SHORT_VOCAL")
+            self.assertTrue(any(e.get("type") == "vision" and e.get("seen") for e in emitted))
+            self.assertTrue(self.wait(lambda: service.summary().get("seen") is True))
+            # A crashed worker comes back by itself.
+            first = service._proc.pid
+            service._proc.kill()
+            self.assertTrue(self.wait(lambda: service._proc.pid != first and service._proc.poll() is None))
+        finally:
+            service.stop()
+            os.environ.pop("MIKO_CAMERA_INDEX", None)
 
 
 class GreetingTests(unittest.TestCase):

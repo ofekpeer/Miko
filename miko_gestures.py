@@ -186,7 +186,7 @@ class WaveDetector:
         xs = [s.x for s in present]
         ys = [s.y for s in present]
         palm = sorted(s.size for s in present)[len(present) // 2]
-        amplitude = max(0.025, 0.35 * palm) if self.source == "hand" else 0.04
+        amplitude = max(0.02, 0.25 * palm) if self.source == "hand" else 0.035
         turns, swings = _zigzag(times, xs, amplitude)
         n = len(turns)
         span_start = times[0]
@@ -220,9 +220,9 @@ class WaveDetector:
                 co_motion = _corr(face_x, hand_at) > 0.6 and _std(face_x) > 0.012
             else:
                 co_motion = _std(face_x) > 0.5 * max(_std(hand_at), 1e-6) and _corr(face_x, hand_at) > 0.6
-        s_swings = max(0.0, min(1.0, (n - 1) / 3.0))
-        s_duration = max(0.0, min(1.0, duration / 0.9))
-        s_coverage = max(0.0, min(1.0, (coverage - 0.3) / 0.45))
+        s_swings = max(0.0, min(1.0, n / 3.0))
+        s_duration = max(0.0, min(1.0, duration / 0.6))
+        s_coverage = max(0.0, min(1.0, (coverage - 0.25) / 0.4))
         confidence = (0.32 * s_swings + 0.14 * s_duration + 0.14 * s_coverage + 0.14 * openness
                       + 0.1 * raised + 0.1 * (1.0 if horizontal else 0.2) + 0.06 * (1.0 if rhythm else 0.0))
         if co_motion:
@@ -237,11 +237,14 @@ class WaveDetector:
 
     def _failed_gates(self, e: dict[str, Any]) -> list[str]:
         failed = []
-        if e["swings"] < 3:
+        # A short clear "hi" (left-right-left) is two swings of an open,
+        # raised hand; weaker evidence (flow, half-open hand) needs three.
+        clear_hand = self.source == "hand" and e["openness"] >= 0.75 and e["raised"] >= 0.6
+        if e["swings"] < (2 if clear_hand else 3):
             failed.append("too_few_swings")
-        if e["duration"] < 0.5:
+        if e["duration"] < (0.2 if clear_hand else 0.5):
             failed.append("too_short")
-        if e["coverage"] < 0.5:
+        if e["coverage"] < (0.4 if self.source == "hand" else 0.55):
             failed.append("hand_not_tracked")
         if e["openness"] < 0.5:
             failed.append("hand_not_open")

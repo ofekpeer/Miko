@@ -220,6 +220,9 @@ func _ready() -> void:
 	miko_preview_mode = OS.get_cmdline_user_args().has("--miko-preview") or OS.get_cmdline_args().has("--miko-preview")
 	if not miko_preview_mode:
 		get_window().min_size = Vector2i(360, 420)
+		# Visible version, so it is obvious which build is actually running.
+		get_window().title = "Miko 17.7"
+		print("MIKO VERSION: 17.7")
 	if animation_player == null:
 		push_error("Miko AnimationPlayer was not found at MikoScene/AnimationPlayer.")
 		return
