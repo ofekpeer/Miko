@@ -20,6 +20,7 @@ protected=['miko_brain_state.json','miko_credentials.dat','miko_integrations.jso
            'miko_brain_state_before_migration.json','miko_device_settings.json']
 sources=['miko_brain.py','miko_realtime.py','miko_realtime_tools.py','miko_vision.py','miko_voice.html',
          'check_miko_camera.py','Check Miko Camera.cmd','miko_perception.py','miko_deps.py',
+         'miko_log.py','miko_physical.py','miko_gestures.py','miko_behavior.py','miko_language.py',
          'start_miko.py','Start Miko.cmd','stop_miko.py','Stop Miko.cmd','requirements_miko.txt']
 excluded={'.godot','.git','__pycache__'}
 for name in sources:
@@ -74,7 +75,7 @@ for process in processes:
         brain_pids.append(int(process['ProcessId']))
 game_pid=launcher.running_game_pid(target/'miko-3d')
 
-backup=Path.home()/'OneDrive'/'Documents'/'MIKO_BACKUPS'/('before_17_4_'+time.strftime('%Y%m%d_%H%M%S'))
+backup=Path.home()/'OneDrive'/'Documents'/'MIKO_BACKUPS'/('before_17_6_'+time.strftime('%Y%m%d_%H%M%S'))
 backup.mkdir(parents=True,exist_ok=False)
 for name in protected+sources+['miko_launch.json']:
     if (target/name).is_file():shutil.copy2(target/name,backup/name)
@@ -122,7 +123,7 @@ config['runtime_dir']=str(target)
 (target/'miko_launch.json').write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
 for name,digest in digests.items():
     if hashlib.sha256((target/name).read_bytes()).hexdigest()!=digest:raise RuntimeError('Persistent data changed: '+name)
-(backup/'INSTALL_VERIFICATION.json').write_text(json.dumps({'data_preserved':True,'files':digests,'version':'17.4'},indent=2),encoding='utf-8')
+(backup/'INSTALL_VERIFICATION.json').write_text(json.dumps({'data_preserved':True,'files':digests,'version':'17.6'},indent=2),encoding='utf-8')
 # Import the new 3D assets now so the first start shows Miko, not a grey window.
 exe=launcher.godot_executable()
 if exe and hasattr(launcher,'ensure_imported'):
@@ -138,6 +139,6 @@ try:
            'none':'Sight: off for now (no internet?). Run Check Miko Camera.cmd later.'}[sight])
 except Exception as error:
     print('Sight packages were not installed:',type(error).__name__)
-print('Miko 17.4 installed. Memory, history, Gmail credentials and device pairing were preserved.')
+print('Miko 17.6 installed. Memory, history, Gmail credentials and device pairing were preserved.')
 print('Backup:',backup)
 print('Open Start Miko.cmd on your Desktop. Hold SPACE in Miko to talk.')

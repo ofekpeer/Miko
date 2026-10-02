@@ -67,9 +67,12 @@ def main() -> int:
             for event in engine.process(frame):
                 name = event["event"]
                 print({"arrived": "**  I see you!", "left": "..  you left the frame",
-                       "wave": "**  you waved - Miko waves back", "approached": "**  you came closer",
+                       "wave": "**  you waved (confirmed) - Miko waves back", "approached": "**  you came closer",
                        "covered": "**  camera covered - Miko can't see", "uncovered": "**  peekaboo - Miko sees again",
-                       "shaken": "**  the camera shook - Miko wobbles", "light_changed": "**  the light changed",
+                       "shake_started": "**  the camera is being shaken - Miko wobbles",
+                       "shake_ended": "**  the shaking stopped", "shake_active": "..  still shaking",
+                       "device_moved": "..  the camera moved (not a shake)", "device_nudged": "..  small bump (ignored)",
+                       "light_changed": "**  the light changed",
                        "motion": "**  something moved", "scene_changed": "**  something in the room changed",
                        "looked_at_miko": "**  you looked at Miko", "looked_away": "..  you looked away",
                        "smiled": "**  you smiled", "laughing": "**  you laughed", "yawned": "**  you yawned",

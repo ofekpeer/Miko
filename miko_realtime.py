@@ -23,6 +23,9 @@ from websockets.asyncio.server import serve
 
 from miko_realtime_tools import MikoRealtimeTools
 import miko_vision
+from miko_behavior import Context, ResponsePolicy, event_kind
+from miko_language import SpeechMonitor
+from miko_log import log
 
 MODEL = os.getenv('MIKO_REALTIME_MODEL', 'gpt-realtime-2.1')
 VOICE = os.getenv('MIKO_REALTIME_VOICE', 'cedar')
@@ -37,8 +40,10 @@ CAMERA_TOOL = {
         'required':['question','source_quote'],'additionalProperties':False},
 }
 
-INSTRUCTIONS = '''אתה מיקו, בן-שיח ועוזר אישי של אופק. דבר בעברית מדוברת, נעימה וטבעית.
+INSTRUCTIONS = '''אתה מיקו, בן-שיח ועוזר אישי של אופק. דבר בעברית ישראלית מדוברת של היום, כמו חבר קרוב.
 כלל מרכזי: הקשב לבקשה האחרונה וענה עליה. אל תדקלם תהליך ואל תחזור על משפט קבוע.
+משפטים קצרים ופשוטים. סלנג רק כשהוא באמת מתאים לרגע, לא בכל משפט.
+אל תמציא מילים ואל תהפוך פועל לשם עצם (לא "איזה נופף חמוד"). אם אתה לא בטוח במילה, תגיד את זה פשוט.
 ברכת שלום צריכה להיות קצרה, למשל "היי אופק, מה איתך?" — בלי תפריט של אפשרויות.
 כאשר יש צורך בכלי, קרא לכלי בלי הקדמה קולית. אל תגיד "רגע אני מעדכן ואז אקריא".
 אחרי הכנת מייל אמור בקצרה למי הוא מיועד ואת תוכנו, ושאל פעם אחת אם לשלוח.
@@ -116,7 +121,14 @@ do not narrate the motion. 'תקפוץ שלוש פעמים' means action jump, t
 Sight: when the camera is on, you perceive the owner locally (presence, where
 they are, waves). Use miko_get_vision for questions about what you see of them;
 it does not show objects or details. Never pretend to see what it doesn't report.
-Notes beginning with [ראייה] are trusted perception events from the host.
+Notes beginning with [perception] are trusted perception facts from the host,
+written in English on purpose: never translate or echo their wording, and never
+describe the event back to the owner ("I see you're waving"). React to it the way
+a person would, or not at all. Most things you notice need no words.
+Hebrew style: natural modern Israeli Hebrew as people actually talk now. Short
+sentences, ordinary words, correct gender and agreement. No literary or
+translated-English phrasing, no invented words or cute diminutives, no automatic
+openers ('ברור', 'בטח', 'וואו', 'אוקיי אז'), and never the same opener twice in a row.
 If an owner turn is silent, only noise or unintelligible, answer with a tiny
 natural reaction ('הממ?' or 'לא שמעתי') - never a speech about being here,
 available or listening. Never repeat a sentence you already said in this conversation.
@@ -128,14 +140,31 @@ history. Old mechanical assistant replies are not examples of your speaking styl
 SESSION_FATAL_ERRORS = {'session_expired', 'invalid_api_key', 'insufficient_quota', 'rate_limit_exceeded',
                         'model_not_found', 'session_closed'}
 
-SPONTANEOUS_STYLE = '''You just noticed the thing in the latest system note, live, with your own
-eyes. React the way a close friend in the room would, in spoken Hebrew:
-usually 1-6 words, sometimes just a sound ('הא!', 'אוו', 'חחח', 'אוי'),
-sometimes a short warm or playful sentence. Match their energy. Be specific
-to what happened. Vary your words every time - never reuse an opener or a
-line you already said. Don't explain, don't offer help, don't ask what they
-want, don't describe yourself as available or listening, don't mention notes,
-cameras or systems, and don't start with 'ברור'. A question is fine only rarely.'''
+SPONTANEOUS_STYLE = '''Something just happened (see the latest [perception] note) and you noticed
+it live. React the way a close Israeli friend in the room would, in natural
+spoken Hebrew: usually 1-5 words or a short sentence, sometimes only a sound
+that fits (e.g. 'אוי', 'הא', 'חחח'). Match their energy and the moment.
+Do NOT translate or echo the note, do not name the event back to them ("you
+waved", "I see you"), and never turn a verb into a noun or invent a word -
+plain correct Hebrew only. Don't explain, don't offer help, don't ask what they
+want, don't describe yourself as available, don't mention notes, cameras or
+systems. A question is fine only rarely. Never reuse an opener or a line you
+already said.'''
+
+
+# Spoken claims that an email/message went out. Only the executor's result
+# can make them true; see NativeSession._check_send_claim.
+SENT_CLAIM = re.compile(r'(?<![\u0590-\u05FF])(?:נשלח|נשלחה|נשלחו|שלחתי|שלחנו|יצא לדרך)(?![\u0590-\u05FF])|\b(?:sent|delivered)\b', re.IGNORECASE)
+SENT_NEGATION = re.compile(r'(?:לא|טרם|עוד לא|עדיין לא|לפני ש|אם|כש|ברגע ש|not|n\'t|before)\s*(?:\S+\s+){0,2}$', re.IGNORECASE)
+
+
+def unverified_send_claim(text):
+    """True when `text` asserts that something was sent (not negated or conditional)."""
+    for match in SENT_CLAIM.finditer(str(text or '')):
+        before = str(text)[max(0, match.start() - 24):match.start()]
+        if not SENT_NEGATION.search(before):
+            return True
+    return False
 
 
 def _safe_error(error):
@@ -248,6 +277,7 @@ class VoiceState:
             if item_id not in self.user_items:
                 self.user_items.add(item_id)
                 self.hub.record('Owner', text, **self.turn_info(item_id))
+        log('STT', 'owner said', chars=len(text or ''), empty=not str(text or '').strip())
         print('MIKO REALTIME HEARD:', text)
 
     def committed(self, item_id, origin_turn=''):
@@ -295,8 +325,14 @@ class VoiceState:
                 self.hub.broadcast({'type':'expression', **arguments})
             if name == 'miko_perform_action' and result.get('ok'):
                 self.hub.broadcast({'type':'action','action':result['action'],'times':result['times']})
+            if name == 'miko_send_email':
+                self.last_send_status = str(result.get('status', ''))
+                if result.get('ok') and result.get('status') == 'sent':
+                    self.last_send_ok_at = time.time()
             self.hub.broadcast({'type':'tool_result', 'name':name, 'result':result})
-            print('MIKO REALTIME TOOL:', name, 'STATUS:', result.get('status', result.get('ok','completed')))
+            status = result.get('status', result.get('ok','completed'))
+            log('EMAIL' if 'email' in name else 'ACTION', 'tool result', tool=name, status=status,
+                ok=bool(result.get('ok', status not in ('tool_error', False))))
             return result
 
     def response_started(self, response_id, origin_turn='', presenter=None):
@@ -455,6 +491,8 @@ class RealtimeHub:
         self.device_error = ''
         self.vision = None
         self.vision_spoken_at = 0.0
+        self.perception_policy = ResponsePolicy()
+        self.speech = SpeechMonitor()
 
     def record(self, role, text, **turn_info):
         with self.brain.state_lock:
@@ -610,62 +648,88 @@ class RealtimeHub:
         self.vision.start()
 
     def vision_reaction(self, event):
-        """Camera thread: something noteworthy happened. The body reacts in
-        Godot from the broadcast event; here Miko remembers it for the
-        conversation and may also say something short."""
+        """Camera/IMU thread: something was perceived. Decide the response
+        level (ResponsePolicy), annotate the event so the body reacts at the
+        same level in Godot, remember it for the conversation, and speak only
+        when the policy allows words."""
+        policy = self._policy()
+        decision = policy.decide(event, self._perception_context())
+        event['level'] = decision.name
         self.vision_context(event)
-        if self.device_bridge and event.get('event') == 'wave':
+        if getattr(self, 'device_bridge', None) and event.get('event') == 'wave' and decision.level >= 3:
             self.broadcast({'type':'action','action':'wave','times':1,'source':'vision'})
-        if self.loop and not self.loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._vision_greeting(event), self.loop)
+        loop = getattr(self, 'loop', None)
+        if decision.vocal and loop and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self._vision_greeting(event, decision), loop)
+        return decision
 
-    # What Miko notices, as plain facts. The model decides how (and whether)
-    # a person would react; these are never read out.
+    def _policy(self):
+        policy = getattr(self, 'perception_policy', None)
+        if policy is None:
+            policy = self.perception_policy = ResponsePolicy()
+        return policy
+
+    def _perception_context(self):
+        natives = list(getattr(self, 'native', ()) or ())
+        user = any(getattr(n, 'ptt_active', False) or getattr(n, 'input_bytes', 0) for n in natives)
+        miko = any(getattr(n, 'responding', False) or getattr(n, 'active_response_id', '')
+                   or getattr(n, 'pending_responses', None) for n in natives)
+        last_turn = 0.0
+        brain = getattr(self, 'brain', None)
+        if brain is not None:
+            with brain.state_lock:
+                history = brain.miko.get('realtime_conversation_history', [])
+                if history and isinstance(history[-1], dict):
+                    last_turn = float(history[-1].get('at', 0) or 0)
+        now = time.time()
+        return Context(now=now, user_speaking=user, miko_speaking=miko,
+                       last_turn_age=now - last_turn if last_turn else 1e9,
+                       session_open=any(getattr(n, 'api', None) for n in natives))
+
+    # What Miko noticed, as neutral facts in English on purpose: the model
+    # writes its own Hebrew instead of echoing (and mangling) the note's words.
     VISION_NOTES = {
-        'wave':'הבעלים מנופף לך לשלום עכשיו.',
-        'arrived':'הבעלים חזר והוא מול המצלמה.',
-        'covered':'מישהו כיסה את המצלמה, פתאום אתה לא רואה כלום.',
-        'uncovered':'המצלמה נחשפה, אתה רואה את הבעלים שוב.',
-        'shaken':'הכל רעד בחוזקה, כאילו טלטלו אותך.',
-        'laughing':'הבעלים צוחק.',
-        'yawned':'הבעלים פיהק.',
-        'winked':'הבעלים קרץ לך.',
-        'frowned':'הבעלים נראה עצוב או מוטרד.',
-        'eyes_closed':'לבעלים עיניים עצומות כבר כמה שניות.',
-        'someone_joined':'מישהו נוסף הצטרף לבעלים מול המצלמה.',
-        'gesture:thumbs_up':'הבעלים עשה לך אגודל למעלה.',
-        'gesture:thumbs_down':'הבעלים עשה לך אגודל למטה.',
-        'gesture:peace':'הבעלים עשה לך סימן וי.',
-        'gesture:love':'הבעלים עשה בידיים את הסימן "אני אוהב אותך".',
-        'gesture:fist':'הבעלים הושיט אגרוף, כמו לכיף.',
+        'wave':'The owner waved hello to you just now.',
+        'arrived':'The owner came back and is in front of the camera again.',
+        'covered':'Someone covered your camera; suddenly you see nothing.',
+        'uncovered':'Your camera is uncovered again; you see the owner.',
+        'shake_ended':'Someone just shook you (your device) for a moment; it has stopped.',
+        'shaken':'Someone just shook you (your device).',
+        'orientation_changed':'Someone turned your device over / on its side.',
+        'laughing':'The owner is laughing.',
+        'yawned':'The owner yawned.',
+        'winked':'The owner winked at you.',
+        'frowned':'The owner looks sad or worried.',
+        'someone_joined':'Another person joined the owner in front of the camera.',
+        'gesture:thumbs_up':'The owner gave you a thumbs up.',
+        'gesture:thumbs_down':'The owner gave you a thumbs down.',
+        'gesture:peace':'The owner showed you a peace / V sign.',
+        'gesture:love':'The owner made the "I love you" hand sign.',
     }
-    # Seconds between spoken reactions of the same kind, and how often a
-    # reaction is spoken at all: the body always reacts, words only sometimes.
-    VISION_COOLDOWN = {'wave':40, 'arrived':90, 'covered':30, 'uncovered':30, 'shaken':30, 'laughing':45,
-                       'yawned':120, 'winked':40, 'frowned':180, 'eyes_closed':180, 'someone_joined':120,
-                       'gesture:thumbs_up':45, 'gesture:thumbs_down':60, 'gesture:peace':60,
-                       'gesture:love':60, 'gesture:fist':60}
-    VISION_TALK_CHANCE = {'wave':0.55, 'arrived':0.8, 'covered':0.5, 'uncovered':0.45, 'shaken':0.7,
-                          'laughing':0.4, 'yawned':0.45, 'winked':0.5, 'frowned':0.6, 'eyes_closed':0.35,
-                          'someone_joined':0.85, 'gesture:thumbs_up':0.5, 'gesture:thumbs_down':0.6,
-                          'gesture:peace':0.45, 'gesture:love':0.8, 'gesture:fist':0.5}
-    # Short facts added silently to an open conversation, so Miko knows what
-    # it saw when the owner talks to it ("you're smiling", "that thumbs up").
+    # Facts added silently to an open conversation, so Miko knows what it saw
+    # when the owner talks to it (also English, not to be echoed).
     CONTEXT_WORDS = {
-        'smiled':'חייך', 'laughing':'צחק', 'yawned':'פיהק', 'surprised':'הופתע', 'frowned':'נראה עצוב',
-        'eyes_closed':'עצם עיניים', 'eyes_opened':'פקח עיניים', 'winked':'קרץ', 'nodded':'הנהן כן',
-        'shook_head':'הניד בראשו לא', 'looked_away':'הסתכל הצידה', 'looked_at_miko':'הסתכל עליך',
-        'someone_joined':'מישהו הצטרף', 'someone_left':'מישהו הלך', 'arrived':'חזר', 'left':'יצא מהתמונה',
-        'wave':'נופף לך', 'covered':'כיסה את המצלמה', 'uncovered':'חשף את המצלמה', 'shaken':'טלטל את המחשב',
-        'gesture:thumbs_up':'עשה אגודל למעלה', 'gesture:thumbs_down':'עשה אגודל למטה', 'gesture:peace':'עשה וי',
-        'gesture:love':'עשה סימן אהבה', 'gesture:fist':'הושיט אגרוף', 'gesture:open_palm':'הרים כף יד',
-        'gesture:pointing':'הצביע', 'scene_changed':'משהו בחדר השתנה', 'light_changed':'האור השתנה',
+        'smiled':'smiled', 'laughing':'laughed', 'yawned':'yawned', 'surprised':'looked surprised',
+        'frowned':'looked sad', 'eyes_closed':'closed their eyes', 'eyes_opened':'opened their eyes',
+        'winked':'winked', 'nodded':'nodded yes', 'shook_head':'shook their head no',
+        'looked_away':'looked away', 'looked_at_miko':'looked at you', 'someone_joined':'someone joined',
+        'someone_left':'someone left', 'arrived':'came back', 'left':'left the camera view', 'wave':'waved at you',
+        'covered':'covered the camera', 'uncovered':'uncovered the camera', 'shake_ended':'shook your device',
+        'shaken':'shook your device', 'orientation_changed':'turned your device over',
+        'device_moved':'moved your device', 'gesture:thumbs_up':'gave a thumbs up',
+        'gesture:thumbs_down':'gave a thumbs down', 'gesture:peace':'showed a peace sign',
+        'gesture:love':'made the "I love you" sign', 'gesture:fist':'held out a fist bump',
+        'gesture:open_palm':'raised an open palm', 'gesture:pointing':'pointed',
+        'scene_changed':'something in the room changed', 'light_changed':'the light changed',
     }
+    # Kinds that may open a closed voice session by themselves (playful,
+    # clearly addressed to Miko). Quiet observations never open a paid session.
+    OPENS_SESSION = {'wave', 'covered', 'uncovered', 'shake_ended', 'shaken', 'orientation_changed',
+                     'gesture:thumbs_up', 'gesture:love', 'gesture:peace', 'someone_joined', 'winked'}
 
     @staticmethod
     def _vision_kind(event):
-        kind = event.get('event', '')
-        return kind + ':' + str(event.get('gesture', '')) if kind == 'gesture' else kind
+        return event_kind(event)
 
     def vision_context(self, event):
         """Camera thread: remember a perception fact for the conversation."""
@@ -682,50 +746,42 @@ class RealtimeHub:
         if not pending or not native.api:
             return
         now = time.time()
-        facts = [f'לפני {int(now - t)} שניות: {w}' for t, w in pending if now - t < 120]
+        facts = [f'{w} ({int(now - t)}s ago)' for t, w in pending if now - t < 120]
         pending.clear()
         if facts:
             await native.api_send({'type':'conversation.item.create','item':{'type':'message','role':'system',
-                'content':[{'type':'input_text','text':'[ראייה, רקע בלבד - לא להגיב על זה ישירות] הבעלים: ' + '; '.join(facts)}]}})
+                'content':[{'type':'input_text','text':'[perception, background only - do not mention unless relevant] The owner: ' + '; '.join(facts)}]}})
 
-    async def _vision_greeting(self, event):
-        import random
+    async def _vision_greeting(self, event, decision=None):
+        """Speak a short reaction when the policy allowed words."""
         kind = self._vision_kind(event)
         note = self.VISION_NOTES.get(kind)
+        if decision is None:
+            decision = self._policy().decide(event, self._perception_context())
+        if not note or self.browser_id or not decision.vocal:
+            return
         now = time.time()
-        if not note or self.browser_id:
-            return
-        spoken = getattr(self, 'vision_event_spoken', {})
-        self.vision_event_spoken = spoken
-        # A social budget: at most one remark every 15 s, and each kind rarely.
-        if now - self.vision_spoken_at < 15 or now - spoken.get(kind, 0) < self.VISION_COOLDOWN.get(kind, 45):
-            return
-        chance = getattr(self, 'vision_talk_chance', self.VISION_TALK_CHANCE).get(kind, 0.4)
-        if random.random() > chance:
-            spoken[kind] = now                  # stay quiet this time, gesture only
-            return
-        if kind in ('arrived', 'wave', 'laughing', 'winked', 'yawned'):
-            with self.brain.state_lock:
-                history = self.brain.miko.get('realtime_conversation_history', [])
-                last_talk = history[-1].get('at', 0) if history and isinstance(history[-1], dict) else 0
-            if now - float(last_talk or 0) < 8:
-                return                      # mid-conversation: the gesture is enough
         for native in list(self.native):
-            if native.responding or native.input_bytes or getattr(native, 'active_response_id', ''):
-                return                      # never talk over the owner or itself
+            if native.responding or native.input_bytes or getattr(native, 'active_response_id', '') or getattr(native, 'ptt_active', False):
+                self._policy().refund(decision)
+                log('BEHAVIOR', 'spoken reaction dropped', event=kind, reason='conversation_busy')
+                return
             if not native.api:
-                # Playful reactions may open the voice session (rate limited);
-                # quiet observations never open a paid connection by themselves.
-                if kind in ('arrived', 'frowned', 'eyes_closed', 'yawned') or now - getattr(self, 'vision_opened_at', 0.0) < 60:
+                if kind not in self.OPENS_SESSION or now - getattr(self, 'vision_opened_at', 0.0) < 60:
                     continue
                 self.vision_opened_at = now
                 await native.ensure_session()
                 if not native.api:
                     continue
-            self.vision_spoken_at = now
-            spoken[kind] = now
-            await native.spontaneous('[ראייה] ' + note)
+            spoke = await native.spontaneous('[perception] ' + note)
+            if spoke:
+                self.vision_spoken_at = now
+                log('BEHAVIOR', 'spoken reaction requested', event=kind, level=decision.name)
+            else:
+                self._policy().refund(decision)
+                log('BEHAVIOR', 'spoken reaction dropped', event=kind, reason='session_not_idle')
             return
+        self._policy().refund(decision)
 
     async def handler(self, ws):
         remote = ws.remote_address
@@ -822,6 +878,12 @@ class NativeSession:
         self.explicit_interrupt_pending = False
         self.lifecycle_lock = asyncio.Lock()
         self.active_response_id = ''
+        # Every waiting state has a deterministic exit: requests and commits
+        # carry their start time and are released when they outlive it.
+        self.request_times = {}
+        self.commit_times = deque()
+        self.last_api_event_at = time.monotonic()
+        self.response_started_at = {}
 
     async def send(self, event):
         try:
@@ -841,15 +903,18 @@ class NativeSession:
         options = dict(response or {})
         options['metadata'] = {**options.get('metadata',{}),'miko_request_id':request_id}
         self.request_options[request_id] = (options, bool(origin_turn and origin_turn.startswith('auto_')), self.generation)
+        self.request_times[request_id] = time.monotonic()
         if len(self.request_options) > 64:
             self.request_options.pop(next(iter(self.request_options)))
+        if len(self.request_times) > 64:
+            self.request_times.pop(next(iter(self.request_times)))
         await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
         if not (origin_turn or '').startswith('auto_'):
             task = asyncio.create_task(self._watch_request(request_id))
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
 
-    async def _watch_request(self, request_id, patience=10.0):
+    async def _watch_request(self, request_id, patience=7.0):
         """Safety net: an owner's answer that never starts (a lost request or
         an API hiccup) is asked for once more, then the window is released
         instead of waiting on 'thinking' forever."""
@@ -864,13 +929,59 @@ class NativeSession:
             if self.active_response_id or request_id in self.deferred_requests:
                 continue                    # it is queued behind a live response
             if attempt == 0 and options is not None:
-                print('MIKO REALTIME: answer did not start, asking again', flush=True)
+                log('RECOVERY', 'answer did not start; asking again', request=request_id[:8], waited=patience)
                 await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
         if request_id in self.pending_responses:
             self.pending_responses.pop(request_id, None)
             self.hub.brain.owner_request_active.clear()
-            print('MIKO REALTIME: answer never started; releasing the window', flush=True)
+            log('RECOVERY', 'answer never started; releasing the window', request=request_id[:8])
             await self.send({'type':'status','status':'idle','detail':'לא התקבלה תשובה - אפשר לדבר שוב'})
+
+    async def _check_send_claim(self, text):
+        """The model may only say 'sent' after the real executor succeeded.
+        A spoken success claim without a successful send result in the last
+        15 minutes is logged and immediately corrected by a host fact."""
+        if not unverified_send_claim(text):
+            return False
+        if time.time() - float(getattr(self.state, 'last_send_ok_at', 0.0) or 0.0) < 900:
+            return False
+        turn = self.state.turn_id
+        if getattr(self, '_claim_corrected_turn', None) == turn:
+            return False
+        self._claim_corrected_turn = turn
+        status = str(getattr(self.state, 'last_send_status', '') or 'no_send_attempt')
+        log('EMAIL', 'unverified success claim corrected', status=status)
+        await self.api_send({'type':'conversation.item.create','item':{'type':'message','role':'system',
+            'content':[{'type':'input_text','text':'[host fact] Nothing was sent: there is no successful send result '
+                        f'(last send status: {status}). Tell the owner in one short Hebrew sentence that it has not been sent.'}]}})
+        await self.request_response({'tool_choice':'none'}, origin_turn=turn)
+        return True
+
+    async def _watch_active(self, response_id, silence=30.0):
+        """A response that started but then went silent (no events at all for
+        `silence` seconds) is cancelled and the window released, so neither
+        the owner nor Miko's own reactions wait on it forever."""
+        while self.active_response_id == response_id and self.api:
+            await asyncio.sleep(min(5.0, silence / 3))
+            if self.active_response_id != response_id:
+                return
+            quiet = time.monotonic() - self.last_api_event_at
+            if quiet < silence:
+                continue
+            log('RECOVERY', 'response went silent; cancelling', seconds=round(quiet, 1))
+            self.discard_responses.add(response_id)
+            self.active_response_id = ''
+            self.responding = False
+            self.hub.brain.owner_request_active.clear()
+            await self.api_send({'type':'response.cancel','response_id':response_id})
+            for item in sorted(self.response_items.get(response_id, ())):
+                if item not in self.output_complete:
+                    self.output_complete.add(item)
+                    await self.send({'type':'audio_done','item_id':item,'content_index':0})
+            await self.send({'type':'status','status':'idle','detail':'אפשר לדבר שוב'})
+            if self.deferred_requests:
+                await self._send_deferred()
+            return
 
     async def _response_rejected(self, request_id):
         """The model refused a response.create because another response was
@@ -903,9 +1014,26 @@ class NativeSession:
             await self.api_send({'type':'response.create','event_id':'evt_'+request_id,'response':options})
             return
 
+    def expire_stale(self):
+        """Release bookkeeping that can no longer complete. A commit the API
+        rejected, or a spontaneous request that never started, would
+        otherwise keep Miko 'busy' (no reactions) for the rest of the session."""
+        now = time.monotonic()
+        while self.commit_times and now - self.commit_times[0] > 15.0:
+            self.commit_times.popleft()
+            if self.pending_commits:
+                stale = self.pending_commits.popleft()
+                log('RECOVERY', 'audio commit never acknowledged; released', turn=str(stale)[:12])
+        for request_id in list(self.pending_responses):
+            _options, spontaneous, _generation = self.request_options.get(request_id, (None, True, -1))
+            if spontaneous and now - self.request_times.get(request_id, now) > 15.0:
+                self.pending_responses.pop(request_id, None)
+                log('RECOVERY', 'spontaneous reply never started; released', request=request_id[:8])
+
     def idle_for_spontaneous(self):
         # Not while the owner holds the key, while an answer is being created
         # (requested but not started yet) or while anything is playing.
+        self.expire_stale()
         return (bool(self.api) and not self.responding and not self.input_bytes and not self.active_response_id
                 and not self.ptt_active and not self.pending_responses and not self.pending_commits
                 and not self.deferred_requests
@@ -927,6 +1055,10 @@ class NativeSession:
         directive = SPONTANEOUS_STYLE
         if recent:
             directive += '\nDo not reuse wording from your recent lines: ' + json.dumps(recent, ensure_ascii=False)
+        speech = getattr(self.hub, 'speech', None)
+        openers = speech.avoid_openers() if speech is not None else []
+        if openers:
+            directive += '\nDo not start with any of: ' + json.dumps(openers, ensure_ascii=False)
         await self.request_response({'instructions':INSTRUCTIONS+'\n'+directive,'tool_choice':'none'},
                                     origin_turn='auto_'+uuid.uuid4().hex)
         return True
@@ -1074,6 +1206,7 @@ class NativeSession:
                 self.input_bytes = 0
                 self.state.begin_turn(audio=True)
                 await self.send({'type':'turn_started', **self.state.turn_info()})
+                log('BRAIN', 'owner turn started', turn=self.state.turn_id[:12], barge_in=bool(self.responding))
             await self.send({'type':'status','status':'listening','detail':''})
         elif kind == 'audio' and self.api:
             audio = event.get('audio','')
@@ -1090,10 +1223,13 @@ class NativeSession:
             if self.mode == 'ptt':
                 if self.input_bytes >= 7200:
                     self.pending_commits.append(self.state.turn_id)
+                    self.commit_times.append(time.monotonic())
+                    log('STT', 'owner audio committed', seconds=round(self.input_bytes / 48000.0, 2))
                     await self.api_send({'type':'input_audio_buffer.commit'})
                     await self.request_response()
                     await self.send({'type':'status','status':'thinking','detail':''})
                 else:
+                    log('STT', 'owner audio too short; discarded', seconds=round(self.input_bytes / 48000.0, 2))
                     await self.api_send({'type':'input_audio_buffer.clear'})
                     self.hub.brain.owner_request_active.clear()
                     await self.send({'type':'status','status':'idle','detail':'Hold SPACE to speak'})
@@ -1184,6 +1320,7 @@ class NativeSession:
             async for payload in api:
                 event = json.loads(payload)
                 kind = event.get('type','')
+                self.last_api_event_at = time.monotonic()
                 response_id = event.get('response_id') or event.get('response',{}).get('id','')
                 if response_id in self.discard_responses:
                     if kind == 'response.done':
@@ -1207,6 +1344,15 @@ class NativeSession:
                     self.responding = True
                     self.active_response_id = response_id
                     self.state.response_started(response_id,turn,presenter)
+                    asked = self.request_times.pop(request_id, None) if request_id else None
+                    self.response_started_at[response_id] = time.monotonic()
+                    if len(self.response_started_at) > 32:
+                        self.response_started_at.pop(next(iter(self.response_started_at)))
+                    log('BRAIN', 'response started', origin='miko' if str(turn).startswith('auto_') else 'owner',
+                        latency=round(time.monotonic() - asked, 2) if asked else -1)
+                    watch = asyncio.create_task(self._watch_active(response_id))
+                    self.tasks.add(watch)
+                    watch.add_done_callback(self.tasks.discard)
                 elif kind == 'input_audio_buffer.speech_started':
                     self.generation += 1
                     if self.active_response_id:
@@ -1218,6 +1364,10 @@ class NativeSession:
                     await self.send({'type':'turn_started', **self.state.turn_info()})
                     await self.send({'type':'interrupted'})
                     await self.send({'type':'status','status':'listening','detail':''})
+                elif kind == 'conversation.item.input_audio_transcription.failed':
+                    # The model still hears the audio itself; only the caption is missing.
+                    log('STT', 'transcription failed; the answer continues from audio',
+                        reason=str((event.get('error') or {}).get('code') or 'unknown')[:40])
                 elif kind == 'conversation.item.input_audio_transcription.completed':
                     self.state.user_transcript(event.get('item_id',''),event.get('transcript',''))
                     await self.send(self.state.transcript_event('user',event.get('item_id',''),event.get('transcript','')))
@@ -1228,6 +1378,8 @@ class NativeSession:
                         await self.send(caption)
                 elif kind == 'input_audio_buffer.committed':
                     origin = self.pending_commits.popleft() if self.pending_commits else ''
+                    if self.commit_times:
+                        self.commit_times.popleft()
                     self.state.committed(event.get('item_id',''),origin)
                     if self.mode == 'hands_free':
                         self.automatic_responses.append((self.state.turn_id,self.generation,copy.copy(self.state.tools)))
@@ -1239,9 +1391,16 @@ class NativeSession:
                     self.output_bytes[item] = self.output_bytes.get(item,0) + len(base64.b64decode(event['delta']))
                     await self.send({'type':'audio','audio':event['delta'],'item_id':item,'content_index':event.get('content_index',0)})
                 elif kind == 'response.output_audio.done':
+                    item = event.get('item_id','')
+                    log('TTS', 'audio generated', seconds=round(self.output_bytes.get(item, 0) / 48000.0, 2))
                     self.output_complete.add(event.get('item_id',''))
                     await self.send({'type':'audio_done','item_id':event.get('item_id',''),'content_index':event.get('content_index',0)})
                 elif kind == 'response.output_audio_transcript.done':
+                    speech = getattr(self.hub, 'speech', None)
+                    if speech is not None:
+                        origin = str(self.state.response_turns.get(response_id, ''))
+                        speech.observe(event.get('transcript',''), 'miko' if origin.startswith('auto_') else 'turn')
+                    await self._check_send_claim(event.get('transcript',''))
                     self.state.assistant_text(event.get('item_id',''),event.get('transcript',''),event.get('response_id',''))
                     await self.send(self.state.transcript_event('assistant',event.get('item_id',''),event.get('transcript',''),event.get('response_id','')))
                 elif kind == 'response.done':
@@ -1252,7 +1411,19 @@ class NativeSession:
                     response = event.get('response',{})
                     calls = [x for x in response.get('output',[]) if x.get('type') == 'function_call']
                     self.state.model_busy = bool(calls)
-                    await self.send({'type':'response_done','status':response.get('status',''),'has_tool_calls':bool(calls)})
+                    status = response.get('status','')
+                    had_audio = bool(self.response_items.get(response_id))
+                    log('BRAIN', 'response done', status=status, tool_calls=len(calls), audio=had_audio,
+                        seconds=round(time.monotonic() - self.response_started_at.pop(response_id, time.monotonic()), 2))
+                    await self.send({'type':'response_done','status':status,'has_tool_calls':bool(calls)})
+                    if not calls and not had_audio and not self.ptt_active and not self.input_bytes \
+                            and not self.pending_responses and not self.deferred_requests:
+                        # Nothing will play (failed / empty / speech generation
+                        # error): do not leave the window on "thinking".
+                        reason = (response.get('status_details') or {}).get('error', {}) if isinstance(response.get('status_details'), dict) else {}
+                        log('RECOVERY', 'response ended without audio; window released', status=status,
+                            reason=str((reason or {}).get('code', ''))[:40])
+                        await self.send({'type':'status','status':'idle','detail':'אפשר לדבר שוב'})
                     if calls and response.get('status') == 'completed':
                         task=asyncio.create_task(self.finish_calls(calls,self.generation,self.state.turn_id))
                         self.tasks.add(task)
@@ -1275,8 +1446,16 @@ class NativeSession:
                     # single request (an item already gone, a late truncate, an
                     # empty buffer) must not drop the owner's turn in progress.
                     if code in SESSION_FATAL_ERRORS or event.get('error',{}).get('type') in ('authentication_error', 'server_error'):
+                        log('RECOVERY', 'session error; window told to reconnect', code=code or 'error')
                         await self.send({'type':'error','message':message,'retryable':True})
                     else:
+                        if 'commit' in str(code) and self.pending_commits:
+                            # The commit was refused (e.g. too little audio): no
+                            # 'committed' will ever come for it.
+                            self.pending_commits.popleft()
+                            if self.commit_times:
+                                self.commit_times.popleft()
+                            log('RECOVERY', 'audio commit refused; released', code=code)
                         print('MIKO REALTIME API NOTE:', code or 'error', message[:160], flush=True)
         except asyncio.CancelledError:
             pass

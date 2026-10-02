@@ -10,6 +10,10 @@ It follows the rules and timing of the real API that matter for Miko:
 - committed input gets a transcript after a delay; empty commits fail;
 - some owner turns call the miko_perform_action tool first.
 Latencies are randomised so races appear the way they do in real use.
+
+MIKO_E2E_FAULTS=stt,tts,brain injects failures: transcription failed (stt),
+a response that fails without any audio (tts), and a response.create that is
+silently lost (brain; the host must ask again).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import random
 
 from websockets.asyncio.server import serve
@@ -35,6 +40,7 @@ class FakeRealtimeConnection:
         self.turns = 0
         self.pending_tool = {}
         self.tool_turn = -1
+        self.faults = {f.strip() for f in os.environ.get("MIKO_E2E_FAULTS", "").split(",") if f.strip()}
 
     def _id(self, prefix):
         self.counter += 1
@@ -87,6 +93,10 @@ class FakeRealtimeConnection:
                 await self.emit({"type": kind + "d", "item_id": event.get("item_id")})
         elif kind == "response.create":
             await asyncio.sleep(self.rng.uniform(0.0, 0.08))
+            if ("brain" in self.faults and "instructions" not in event.get("response", {})
+                    and not self.active and self.rng.random() < 0.1):
+                self.stats["fault_lost_request"] = self.stats.get("fault_lost_request", 0) + 1
+                return                      # lost: no created, no error
             if self.active:
                 self.stats["collisions"] += 1
                 await self.emit({"type": "error", "error": {
@@ -111,6 +121,11 @@ class FakeRealtimeConnection:
     async def _transcribe(self, item, number):
         await asyncio.sleep(self.rng.uniform(0.15, 0.9))
         text = "תקפוץ" if number % 5 == 0 else f"משפט {number} של הבעלים"
+        if "stt" in self.faults and self.rng.random() < 0.3:
+            self.stats["fault_stt"] = self.stats.get("fault_stt", 0) + 1
+            await self.emit({"type": "conversation.item.input_audio_transcription.failed", "item_id": item,
+                             "error": {"code": "transcription_failed", "message": "fault injected"}})
+            return
         await self.emit({"type": "conversation.item.input_audio_transcription.completed", "item_id": item, "transcript": text})
 
     async def _respond(self, response_id, options):
@@ -135,6 +150,15 @@ class FakeRealtimeConnection:
                 {"type": "function_call", "call_id": call_id, "name": "miko_perform_action",
                  "arguments": json.dumps({"action": "jump", "times": 2})}]}})
             self.stats["tool_calls"] += 1
+            return
+        if "tts" in self.faults and not spontaneous and self.rng.random() < 0.15:
+            await asyncio.sleep(self.rng.uniform(0.2, 0.6))
+            if self.active != response_id:
+                return
+            self.active = None
+            self.stats["fault_tts"] = self.stats.get("fault_tts", 0) + 1
+            await self.emit({"type": "response.done", "response": {"id": response_id, "status": "failed", "output": [],
+                             "status_details": {"type": "failed", "error": {"code": "audio_generation_failed"}}}})
             return
         item = self._id("item_assistant")
         text = ("אוי, מה זה היה" if spontaneous else f"תשובה {response_id}")

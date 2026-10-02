@@ -71,12 +71,16 @@ class HandObs:
     index_tip: tuple
     index_base: tuple
     handedness: str = ""
+    openness: float = -1.0        # share of the four fingers extended, -1 unknown
+    size: float = 0.0             # wrist -> middle knuckle, relative to frame width
+    center: tuple = ()            # palm center (x, y)
 
 
 @dataclass
 class Observation:
     faces: list = field(default_factory=list)
     hands: list = field(default_factory=list)
+    hands_checked: bool = False   # the hand model ran on this frame
 
 
 # ---------------------------------------------------------------- MediaPipe
@@ -148,7 +152,9 @@ class MediaPipePerception:
                 face.blend = {c.category_name: float(c.score) for c in result.face_blendshapes[index]}
             obs.faces.append(face)
         if self.hands is not None and self._frame % self.hand_every == 0:
+            obs.hands_checked = True
             hands = self.hands.recognize_for_video(image, ms)
+            aspect = small.shape[0] / float(max(1, small.shape[1]))
             for index, landmarks in enumerate(hands.hand_landmarks or []):
                 gesture, score = "", 0.0
                 if hands.gestures and index < len(hands.gestures) and hands.gestures[index]:
@@ -157,10 +163,33 @@ class MediaPipePerception:
                 handed = ""
                 if hands.handedness and index < len(hands.handedness) and hands.handedness[index]:
                     handed = hands.handedness[index][0].category_name
+                openness, size, center = _hand_shape(landmarks, aspect)
                 obs.hands.append(HandObs(gesture, score, (landmarks[0].x, landmarks[0].y),
-                                         (landmarks[8].x, landmarks[8].y), (landmarks[5].x, landmarks[5].y), handed))
+                                         (landmarks[8].x, landmarks[8].y), (landmarks[5].x, landmarks[5].y), handed,
+                                         openness, size, center))
         obs.faces.sort(key=lambda f: -f.w)            # nearest (largest) first
         return obs
+
+
+def _hand_shape(landmarks, aspect: float = 0.75) -> tuple[float, float, tuple]:
+    """Openness (share of extended fingers), palm size and palm center from
+    the 21 hand landmarks. A finger is extended when its tip is clearly
+    farther from the wrist than its middle joint."""
+    def point(i):
+        return landmarks[i].x, landmarks[i].y * aspect          # square units
+
+    wx, wy = point(0)
+    extended = 0
+    for pip, tip in ((6, 8), (10, 12), (14, 16), (18, 20)):
+        px, py = point(pip)
+        tx, ty = point(tip)
+        if math.hypot(tx - wx, ty - wy) > 1.12 * math.hypot(px - wx, py - wy):
+            extended += 1
+    mx, my = point(9)
+    size = math.hypot(mx - wx, my - wy)
+    ids = (0, 5, 9, 13, 17)
+    center = (sum(landmarks[i].x for i in ids) / 5.0, sum(landmarks[i].y for i in ids) / 5.0)
+    return extended / 4.0, size, center
 
 
 # ---------------------------------------------------------------- analyzers
@@ -249,6 +278,12 @@ class FaceAnalyzer:
 
     def reset(self) -> None:
         self.__init__()
+
+    def camera_moved(self) -> None:
+        """The camera itself moved: head pose relative to it changed without
+        the person doing anything, so pose history is no longer evidence."""
+        self._nod.clear()
+        self._shake.clear()
 
     def update(self, f: FaceObs, now: float) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -347,22 +382,37 @@ class FaceAnalyzer:
 
 
 class HandAnalyzer:
-    """Stable hand gestures, landmark-based waves and pointing direction."""
+    """Stable (held) hand gestures and pointing direction. Waves are a
+    temporal pattern and live in miko_gestures.WaveDetector; a moving hand
+    is never also reported as a held gesture."""
+
+    HOLD_SECONDS = 0.35
+    STILL_SPREAD = 0.025          # wrist spread (image widths) still counted as "held"
 
     def __init__(self) -> None:
         self._gesture = ""
         self._gesture_since = 0.0
         self._last: dict[str, float] = {}
-        self._wrist = _Oscillation(2.0)
-        self._open_recent = -1e9
+        self._wrist: deque = deque(maxlen=30)       # (t, x, y)
+
+    def _still(self, now: float) -> bool:
+        recent = [(x, y) for t, x, y in self._wrist if now - t <= 0.5]
+        if len(recent) < 2:
+            return True
+        xs, ys = [p[0] for p in recent], [p[1] for p in recent]
+        return max(xs) - min(xs) <= self.STILL_SPREAD * 2 and max(ys) - min(ys) <= self.STILL_SPREAD * 2
 
     def update(self, hands: list, now: float) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         best = max(hands, key=lambda h: h.score) if hands else None
+        if best is not None:
+            self._wrist.append((now, best.wrist[0], best.wrist[1]))
         gesture = best.gesture if best is not None and best.score >= 0.6 else ""
         if gesture != self._gesture:
             self._gesture, self._gesture_since = gesture, now
-        elif gesture and now - self._gesture_since >= 0.35 and now - self._last.get(gesture, -1e9) > 4.0:
+        elif gesture and not self._still(now):
+            self._gesture_since = now                 # waving / moving: not a held sign
+        elif gesture and now - self._gesture_since >= self.HOLD_SECONDS and now - self._last.get(gesture, -1e9) > 4.0:
             self._last[gesture] = now
             event = {"event": "gesture", "gesture": gesture}
             if gesture == "pointing" and best is not None:
@@ -370,17 +420,6 @@ class HandAnalyzer:
                 dx = best.index_tip[0] - best.index_base[0]
                 event["x"] = round(max(-1.0, min(1.0, -dx * 8.0)), 2)
             out.append(event)
-        # Wave: an open hand swinging sideways (works even when the
-        # recognizer calls a blurry hand "None").
-        if best is not None:
-            if best.gesture in ("open_palm", "") or best.score < 0.6:
-                self._wrist.add(now, best.wrist[0])
-            if best.gesture == "open_palm":
-                self._open_recent = now
-            if (self._wrist.swings(now, 0.06) >= 2 and now - self._last.get("wave", -1e9) > 4.0):
-                self._last["wave"] = now
-                self._wrist.clear()
-                out.append({"event": "wave", "hand": best.handedness.lower() or "unknown", "source": "hand"})
         return out
 
 

@@ -41,6 +41,9 @@ static bool s_vision_active;
 static TickType_t s_vision_interval;
 static TickType_t s_vision_next;
 static uint32_t s_vision_sequence;
+static miko_imu_sample_t s_imu_batch[20];
+static size_t s_imu_count;
+static uint32_t s_imu_sequence;
 static uint8_t *s_rx_data;
 static size_t s_rx_total;
 static uint8_t s_rx_opcode;
@@ -213,6 +216,7 @@ static bool authenticate(const char *server_nonce)
     cJSON_AddItemToArray(caps, cJSON_CreateString("gesture"));
     if (s_config.camera_enabled) cJSON_AddItemToArray(caps, cJSON_CreateString("camera"));
     if (s_config.vision_enabled) cJSON_AddItemToArray(caps, cJSON_CreateString("vision"));
+    if (s_config.motion_enabled) cJSON_AddItemToArray(caps, cJSON_CreateString("motion"));
     memset(proof_bytes, 0, sizeof proof_bytes);
     memset(canonical, 0, sizeof canonical);
     return ws_send_json(object);
@@ -423,6 +427,44 @@ static void maybe_send_vision(void)
     miko_board_vision_discard(jpeg);
 }
 
+/* Batch IMU samples into one 05 frame per ~100 ms:
+ * 05 | u32 sequence | u32 base_ms | u8 count | count x (u16 offset_ms, 6 x i16). */
+static void maybe_send_motion(void)
+{
+    if (!s_config.motion_enabled) return;
+    miko_imu_sample_t sample;
+    while (s_imu_count < 20 && miko_board_imu_read(&sample) == ESP_OK) {
+        if (s_imu_count && (sample.t_ms < s_imu_batch[0].t_ms || sample.t_ms - s_imu_batch[0].t_ms > 60000)) {
+            s_imu_count = 0;                                   /* clock jump: start a new batch */
+        }
+        s_imu_batch[s_imu_count++] = sample;
+        if (sample.t_ms - s_imu_batch[0].t_ms >= 100) break;
+    }
+    if (!s_imu_count || (s_imu_count < 20 && s_imu_batch[s_imu_count - 1].t_ms - s_imu_batch[0].t_ms < 100)) return;
+    uint8_t frame[10 + 20 * 14];
+    uint32_t base = s_imu_batch[0].t_ms;
+    frame[0] = 0x05;
+    frame[1] = (uint8_t)(s_imu_sequence >> 24); frame[2] = (uint8_t)(s_imu_sequence >> 16);
+    frame[3] = (uint8_t)(s_imu_sequence >> 8); frame[4] = (uint8_t)s_imu_sequence;
+    frame[5] = (uint8_t)(base >> 24); frame[6] = (uint8_t)(base >> 16);
+    frame[7] = (uint8_t)(base >> 8); frame[8] = (uint8_t)base;
+    frame[9] = (uint8_t)s_imu_count;
+    size_t at = 10;
+    for (size_t i = 0; i < s_imu_count; ++i) {
+        const miko_imu_sample_t *p = &s_imu_batch[i];
+        uint16_t offset = (uint16_t)(p->t_ms - base);
+        int16_t values[6] = {p->ax, p->ay, p->az, p->gx, p->gy, p->gz};
+        frame[at++] = (uint8_t)(offset >> 8); frame[at++] = (uint8_t)offset;
+        for (int k = 0; k < 6; ++k) {
+            frame[at++] = (uint8_t)((uint16_t)values[k] >> 8);
+            frame[at++] = (uint8_t)values[k];
+        }
+    }
+    if (esp_websocket_client_send_bin(s_ws, (const char *)frame, (int)at, WS_WAIT) != (int)at) s_fatal = true;
+    s_imu_sequence++;
+    s_imu_count = 0;
+}
+
 void app_main(void)
 {
     memset(&s_config, 0, sizeof s_config);
@@ -493,6 +535,7 @@ void app_main(void)
         }
         maybe_send_camera();
         maybe_send_vision();
+        maybe_send_motion();
         if (capture) {
             size_t count = MIC_SAMPLES;
             if (miko_board_mic_read(samples, &count, 20) == ESP_OK && count <= MIC_SAMPLES)

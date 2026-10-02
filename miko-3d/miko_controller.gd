@@ -228,6 +228,10 @@ func _ready() -> void:
 		_on_animation_finished
 	)
 
+	var guardian = preload("res://miko_guardian.gd").new()
+	guardian.name = "MikoGuardian"
+	guardian.setup(self)
+	add_child(guardian)
 	_setup_robot_features()
 	_setup_expression_system()
 	if presence != null:
@@ -5481,11 +5485,12 @@ func _on_realtime_vision(event: Dictionary) -> void:
 		_refresh_camera_button()
 		return
 	if str(event.get("type", "")) == "vision_event" and realtime_status_label != null:
-		var noticed := {"wave": "נפנוף", "arrived": "הגעת", "left": "יצאת מהתמונה", "approached": "התקרבת",
-			"covered": "המצלמה מכוסה", "uncovered": "רואה שוב", "shaken": "טלטול", "light_changed": "שינוי תאורה",
-			"motion": "תנועה"}
+		# Only noteworthy things, and never over the conversation status line.
+		var noticed := {"wave": "נפנוף", "arrived": "חזרת", "covered": "המצלמה מכוסה", "uncovered": "רואה שוב",
+			"shake_started": "טלטול", "shaken": "טלטול", "orientation_changed": "הפכו אותי"}
 		var label := str(noticed.get(str(event.get("event", "")), ""))
-		if not label.is_empty():
+		var level := str(event.get("level", "ANIMATION_ONLY"))
+		if not label.is_empty() and level not in ["NO_REACTION", "MICRO", "FACIAL"] and not _interaction_busy():
 			realtime_status_label.text = "מיקו שם לב: " + label
 	var character := get_node_or_null("MikoScene")
 	if character != null and character.has_method("on_vision"):

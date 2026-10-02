@@ -71,9 +71,8 @@ def main():
         while "hub" not in holder or holder["hub"].loop is None:
             time.sleep(0.2)
         hub = holder["hub"]
-        hub.VISION_COOLDOWN = {k: 0 for k in hub.VISION_COOLDOWN}
-        hub.vision_talk_chance = {k: 1.0 for k in hub.VISION_TALK_CHANCE}
-        events = ["wave", "covered", "uncovered", "shaken", "arrived", "motion", "scene_changed", "looked_at_miko",
+        hub.perception_policy.stress_mode = True       # every event asks to speak: stress collisions
+        events = ["wave", "covered", "uncovered", "shake_started", "shake_ended", "device_moved", "arrived", "motion", "scene_changed", "looked_at_miko",
                   "smiled", "laughing", "yawned", "winked", "frowned", "nodded", "someone_joined", "gesture"]
         while True:
             time.sleep(rng.uniform(0.4, 3.0))

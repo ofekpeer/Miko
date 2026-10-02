@@ -21,3 +21,4 @@ esp_err_t miko_board_vision_start(uint32_t f, uint32_t w, uint32_t h) { (void)f;
 esp_err_t miko_board_vision_frame(uint8_t **j, size_t *n) { (void)j; (void)n; return ESP_ERR_NOT_FOUND; }
 void miko_board_vision_discard(uint8_t *j) { (void)j; }
 void miko_board_vision_stop(void) {}
+esp_err_t miko_board_imu_read(miko_imu_sample_t *s) { (void)s; return ESP_ERR_NOT_FOUND; }

@@ -38,7 +38,9 @@ from .protocol import (
     HEX_16_RE,
     ProtocolError,
     decode_camera_jpeg,
+    decode_motion_imu,
     decode_vision_jpeg,
+    MAX_IMU_SAMPLES_PER_SECOND,
     VISION_MAX_FPS,
     VISION_STREAM,
     decode_pairing_secret,
@@ -117,7 +119,7 @@ class BridgeSettings:
             if not isinstance(raw_caps, list) or not all(isinstance(x, str) for x in raw_caps):
                 raise DeviceConfigError("invalid device capabilities")
             capabilities = frozenset(raw_caps)
-            if not capabilities or not capabilities <= {"audio", "display", "gesture", "camera", "vision"}:
+            if not capabilities or not capabilities <= {"audio", "display", "gesture", "camera", "vision", "motion"}:
                 raise DeviceConfigError("unsupported device capability")
             devices[device_id] = PairedDevice(device_id, secret, capabilities)
         if enabled and (not devices or not cert_path or not key_path or not cert_path.is_file() or not key_path.is_file()):
@@ -436,6 +438,8 @@ class DeviceBridge:
             await connection.native.client_event({"type": "audio", "audio": base64.b64encode(pcm).decode("ascii")})
         elif frame[0] == 0x04:
             await self._vision_frame(connection, frame)
+        elif frame[0] == 0x05:
+            await self._motion_frame(connection, frame)
         elif frame[0] == 0x03:
             request_id, jpeg = decode_camera_jpeg(frame)
             future = connection.pending_snapshots.pop(request_id, None)
@@ -483,6 +487,25 @@ class DeviceBridge:
             await asyncio.to_thread(vision.feed_jpeg, jpeg)
         finally:
             connection.vision_busy = False
+
+    async def _motion_frame(self, connection: "_DeviceConnection", frame: bytes) -> None:
+        """IMU samples: the device feels itself being shaken, moved or turned
+        over (not a camera; works with sight switched off)."""
+        if "motion" not in connection.capabilities:
+            raise ProtocolError("unsolicited motion frame")
+        _, samples = decode_motion_imu(frame)
+        now = time.monotonic()
+        # Bounded: a window of one second at most MAX_IMU_SAMPLES_PER_SECOND
+        # samples; excess batches are dropped, not queued.
+        if now - connection.motion_window_at >= 1.0:
+            connection.motion_window_at, connection.motion_samples = now, 0
+        connection.motion_samples += len(samples)
+        if connection.motion_samples > MAX_IMU_SAMPLES_PER_SECOND:
+            return
+        vision = getattr(self.hub, "vision", None)
+        if vision is None or not hasattr(vision, "feed_imu"):
+            return
+        await asyncio.to_thread(vision.feed_imu, samples)
 
     async def request_snapshot(self, device_id: str, *, requested_by_user: bool) -> bytes:
         """Request one in-memory JPEG only for an explicit user request.
@@ -558,6 +581,8 @@ class _DeviceConnection:
     vision_active: bool = False
     vision_busy: bool = False
     last_vision_at: float = 0.0
+    motion_window_at: float = 0.0
+    motion_samples: int = 0
     finalized: asyncio.Event = field(default_factory=asyncio.Event)
 
     def __post_init__(self) -> None:

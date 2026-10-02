@@ -1,5 +1,6 @@
 class_name MikoRealtimeVoice
 extends Node
+const MikoLog = preload("res://miko_log.gd")
 
 signal status_changed(status: String, detail: String)
 signal transcript(role: String, text: String, turn_id: String, turn_number: int, session_id: String, item_id: String)
@@ -867,6 +868,23 @@ func _fail_transport(message: String) -> void:
 	status_changed.emit("error", message)
 	if _socket != null and _socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		_socket.close(1011, "Voice transport stalled")
+
+
+## Deterministic exit from any turn state (watchdog/backstop): stop the
+## microphone, drop pending input and playback, and become ready again.
+func recover(reason: String) -> void:
+	MikoLog.info("RECOVERY", "voice client reset", {"reason": reason, "turn_pending": _turn_pending,
+		"capture": _capture_active, "speaking": _speaker_active, "remote_ready": _remote_ready})
+	if _remote_start_sent:
+		_send({"type": "stop"})
+	_remote_start_sent = false
+	_capture_active = false
+	_turn_pending = false
+	_ptt_finalizing = false
+	_pending_input.clear()
+	_clear_capture()
+	_clear_playback()
+	status_changed.emit("idle", "Ready")
 
 
 func set_vision_enabled(enabled: bool) -> void:

@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--chaos", action="store_true")
     parser.add_argument("--godot", default=os.environ.get("GODOT", "godot"))
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--faults", default="", help="comma list of stt,tts,brain failures to inject")
+    parser.add_argument("--rapid", action="store_true", help="bursts of rapid SPACE taps between turns")
     args = parser.parse_args()
 
     sandbox = Path(tempfile.mkdtemp(prefix="miko_e2e_"))
@@ -58,7 +60,8 @@ def main():
     (sandbox / "miko_brain_state.json").write_text(json.dumps({"last_seen": time.time()}), encoding="utf-8")
     stats_path = sandbox / "e2e_stats.json"
     env = dict(os.environ, HOME=str(sandbox), USERPROFILE=str(sandbox), OPENAI_API_KEY="offline-e2e",
-               OPENAI_BASE_URL="http://127.0.0.1:9/v1", MIKO_VISION="0", PYTHONUNBUFFERED="1", PYTHONUTF8="1")
+               OPENAI_BASE_URL="http://127.0.0.1:9/v1", MIKO_VISION="0", PYTHONUNBUFFERED="1", PYTHONUTF8="1",
+               MIKO_E2E_FAULTS=args.faults)
     host_log = open(sandbox / "host.log", "w", encoding="utf-8")
     host = subprocess.Popen([sys.executable, "-X", "utf8", str(HERE / "e2e_host.py"), "--sandbox", str(sandbox),
                              "--stats", str(stats_path), "--seed", str(args.seed)] + (["--chaos"] if args.chaos else []),
@@ -69,7 +72,8 @@ def main():
             print("host did not start; log:", (sandbox / "host.log").read_text(encoding="utf-8")[-3000:])
             return 1
         godot = subprocess.Popen([args.godot, "--headless", "--path", str(ROOT / "miko-3d"), "res://tests/e2e_driver.tscn",
-                                  "--", f"--turns={args.turns}", f"--seed={args.seed}"],
+                                  "--", f"--turns={args.turns}", f"--seed={args.seed}"]
+                                 + (["--faults"] if args.faults else []) + (["--rapid"] if args.rapid else []),
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         summary = ""
         for line in godot.stdout:

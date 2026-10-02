@@ -1,3 +1,82 @@
+# Miko 17.6 verification — believable reactions, no frozen states
+
+## Root causes found and fixed
+
+- **Shake false positives (video 11):** any two image-shift reversals within
+  1.4 s (or five jolts) became "shaken", repeatedly, so moving the laptop or
+  adjusting the lid made Miko react again and again. Replaced by
+  `miko_physical.py`: episodes with dead zone, smoothing, hysteresis, minimum
+  durations, sustained (non-decaying) swings, a briskness window, refractory
+  period and confidence. One action now gives `shake_started` →
+  `shake_active` (≤ 1/s) → `shake_ended`; small movement is `device_nudged` /
+  `device_moved`.
+- **Camera motion measured on the person:** a head moving in front of a plain
+  wall registered as camera motion (and could become a shake). Global motion is
+  now measured on the background only (face/body masked, raw and smoothed boxes)
+  and only when the background has texture.
+- **Hallucinated waves:** a wave fired from 2 flow reversals or 2 wrist swings
+  of 6 % frame width, with no openness, height, camera-stability or head-motion
+  checks, and the HandAnalyzer also reported a moving open palm as a held
+  "open_palm" sign (double reaction). `miko_gestures.py` adds an evidence model
+  (POSSIBLE logged only, CONFIRMED ≥ 0.8 with all gates); a moving hand is no
+  longer a held sign; while the camera/device moves, waves, room changes and
+  head-pose events are suspended.
+- **Host waiting states without exits (freeze class):**
+  - a refused audio commit left `pending_commits` non-empty for the rest of the
+    session, which disabled Miko's own reactions;
+  - a spontaneous request that never started was never released;
+  - a response that failed without audio left the window on "thinking" until
+    the 45 s client backstop;
+  - a response that started and then went silent had no exit at all.
+  Each now has a deterministic exit and a `RECOVERY` log line.
+- **Robot body freeze while audio continues (video 10):** not reproduced
+  offline. The plausible mechanism (a robot update step failing every frame, or
+  a non-finite pose) is now detected: frame heartbeat with the failing stage
+  named in the log plus a reset to idle, and a non-finite-state guard. The real
+  cause on the owner's PC will be visible in the log as `RECOVERY: robot update
+  stalled stage=...`.
+- **Unnatural Hebrew ("איזה נופף חמוד"):** the model echoed Hebrew perception
+  notes ("מנופף"). Notes and background facts are now neutral English facts;
+  style rules and the concrete counter-example are in the instructions;
+  `miko_language.py` flags invented words, canned phrases, sensor narration
+  and repeated openers, and recent openers are excluded from the next
+  spontaneous reply.
+- **"נשלח" without a send:** only prompt-enforced before. A spoken success claim
+  without a successful executor result in the last 15 minutes is now logged
+  (`EMAIL`) and corrected immediately by a host fact.
+
+## Verified checks (this environment, Linux, Godot 4.7.2 headless)
+
+`python diagnostics/run_all_tests.py --e2e` → **ALL PASSED**:
+
+- Python: realtime tools, realtime host (26), confirm flow, long session,
+  device host, vision (24), perception (12), **events (23, acceptance A–H)**,
+  **language (10, acceptance O, P, Q)**, device bridge incl. IMU frames.
+- Godot: robot commands, presence, soak, **behaviour arbiter (I, C, D, P)**,
+  **robot fuzz (9000 frames, heartbeat never stalls)**, **guardian (stall
+  recovery, thinking timeout, performance step-down)**, plus the existing
+  voice/caption/SPACE gates.
+- End-to-end, real host + real Godot window + fake Realtime:
+  - 25 turns with random perception events, ~25 % barge-in (J):
+    25 answered, 0 stuck;
+  - 25 turns with rapid SPACE bursts (N) and injected STT failures (K), lost
+    model requests (L) and audio-generation failures (M): 12 answered,
+    13 released cleanly, 0 stuck. In the faults-only run every injected TTS
+    failure released the window, lost requests were re-asked and answered,
+    and STT failures were still answered.
+- One host-suite run out of ~14 repetitions failed once and could not be
+  reproduced afterwards; treat it as a possible pre-existing timing flake.
+
+## Not verified
+
+- Nothing was run on the owner's Windows PC, webcam, GPU or microphone.
+  Thresholds (shake px/frame, wave amplitude, texture) were tuned on synthetic
+  video; real-room tuning may be needed — the new logs show the measured
+  values and the reason for every decision.
+- The real OpenAI model's Hebrew was not re-sampled in this release; the
+  language checks are heuristics run on sample lines and on live transcripts.
+- Firmware IMU batching was not compiled (no ESP-IDF here) or run on a board.
+
 # Miko 17.2 verification
 
 ## Confirmation loop

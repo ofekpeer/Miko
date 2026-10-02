@@ -20,6 +20,7 @@ typedef struct {
     uint8_t pairing_secret[32];      /* read from provisioned NVS */
     bool camera_enabled;             /* false until owner explicitly provisions it */
     bool vision_enabled;             /* owner-provisioned perception stream (presence, waves) */
+    bool motion_enabled;             /* IMU present (e.g. QMI8658): shake / moved / turned over */
     bool hands_free;                  /* board must supply AEC and visible mic state */
 } miko_board_config_t;
 
@@ -70,3 +71,15 @@ esp_err_t miko_board_vision_start(uint32_t fps, uint32_t width, uint32_t height)
 esp_err_t miko_board_vision_frame(uint8_t **jpeg, size_t *length);
 void miko_board_vision_discard(uint8_t *jpeg);
 void miko_board_vision_stop(void);
+
+/* Motion ("Miko feels being picked up or shaken"): IMU samples, batched and
+ * sent as 05 frames about 10 times a second (<= 200 samples/s, <= 32 per
+ * batch). The server turns them into one event per physical action. Return
+ * ESP_ERR_NOT_FOUND when no new sample is ready. Units: accel milli-g,
+ * gyro 0.1 deg/s, timestamp milliseconds on a monotonic device clock. */
+typedef struct {
+    uint32_t t_ms;
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+} miko_imu_sample_t;
+esp_err_t miko_board_imu_read(miko_imu_sample_t *sample);

@@ -12,10 +12,15 @@ off and Miko works as before. Face detection uses OpenCV's YuNet model
 (vision_models/face_detection_yunet_2023mar.onnx, MIT); if the file is
 missing a Haar cascade bundled with OpenCV is used instead.
 
-Waves are detected without a hand model: dense optical flow beside and above
-the face, looking for repeated left-right reversals while the face itself
-stays fairly still. That is cheap enough for a laptop and for the
-low-resolution frames a small device camera can send.
+Interpretation is temporal, not per frame (see miko_physical.py and
+miko_gestures.py): whole-image motion feeds a PhysicalInteractionDetector
+(nudge / move / shake episodes with start, active and end), and while the
+camera or device moves, scene-relative perception (waves, room changes, head
+gestures) is suspended because every pixel moves. Waves need evidence over
+time (open raised hand, sustained sideways swings, steady camera, the head
+not doing the same) and are confirmed only at high confidence. With
+MediaPipe the evidence is hand landmarks; without it, optical flow beside
+the face is used with the same gates.
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ try:  # Optional richer perception (MediaPipe): expressions, gestures, gaze.
 except Exception:  # pragma: no cover
     miko_perception = None
 
+from miko_gestures import FaceSample, HandSample, WaveDetector
+from miko_log import debug, log, throttled
+from miko_physical import CAMERA, ImuInterpreter, PhysicalInteractionDetector
+
 try:  # Optional: the rest of Miko must keep working without OpenCV.
     import cv2
     import numpy as np
@@ -50,10 +59,9 @@ FLOW_WIDTH = 160               # optical-flow frame width
 PRESENT_AFTER = 2              # consecutive face frames before "seen"
 ABSENT_AFTER_S = 3.5           # no face for this long -> "left"
 ARRIVE_AFTER_ABSENCE_S = 8.0   # re-greet only after a real absence
-WAVE_WINDOW_S = 2.2
-WAVE_MIN_REVERSALS = 2         # left-right-left is a wave
-WAVE_COOLDOWN_S = 4.0
 STATE_INTERVAL_S = 0.2         # vision state broadcast rate (5 Hz)
+# Perception that is only meaningful while the camera is still.
+POSE_EVENTS = {"nodded", "shook_head", "tilted_head", "looked_away", "looked_at_miko", "looked_somewhere"}
 
 
 def available() -> bool:
@@ -70,34 +78,13 @@ class _Face:
     frontal: bool
 
 
-class _Oscillation:
-    """Counts direction reversals of a signed velocity within a time window."""
-
-    def __init__(self, window: float) -> None:
-        self.window = window
-        self.samples: deque = deque(maxlen=60)   # (t, v)
-
-    def add(self, t: float, v: float) -> None:
-        self.samples.append((t, v))
-
-    def reversals(self, now: float, threshold: float) -> int:
-        signs = []
-        for t, v in self.samples:
-            if now - t <= self.window and abs(v) >= threshold:
-                sign = 1 if v > 0 else -1
-                if not signs or signs[-1] != sign:
-                    signs.append(sign)
-        return max(0, len(signs) - 1)
-
-    def clear(self) -> None:
-        self.samples.clear()
-
-
 class VisionEngine:
     """Turns frames into presence, position, gesture and scene-change events.
 
-    Events: arrived, left, approached, wave, covered, uncovered, shaken,
-    light_changed, motion. Pure computation, no I/O.
+    Events: arrived, left, approached, wave, covered, uncovered,
+    shake_started / shake_active / shake_ended, device_moved, device_nudged,
+    light_changed, scene_changed, motion, plus MediaPipe face/hand events.
+    Pure computation, no I/O.
     """
 
     def __init__(self, model_path: str = YUNET_PATH, use_mediapipe: bool = True) -> None:
@@ -134,6 +121,7 @@ class VisionEngine:
         self._cost: deque = deque(maxlen=30)
         self.seen = False
         self.face: _Face | None = None
+        self._raw_face: _Face | None = None
         self._smooth: _Face | None = None
         self._streak = 0
         self._last_face_at = -1e9
@@ -143,10 +131,15 @@ class VisionEngine:
         self._last_approach = -1e9
         # Scene / motion state.
         self._prev_gray = None
-        self._wave = _Oscillation(WAVE_WINDOW_S)
-        self._shake = _Oscillation(1.4)
-        self._last_wave = -1e9
-        self._last_shake = -1e9
+        self.physical = PhysicalInteractionDetector(CAMERA, source="camera")
+        self.camera_stable = True
+        self.imu_unstable_until = -1e9      # set by the device IMU when it moves
+        self.imu_active_until = -1e9        # IMU is the shake source while it streams
+        # Hand landmarks are the wave evidence when MediaPipe is present;
+        # optical flow may then only report candidates, never confirm.
+        self.hand_wave = WaveDetector("hand")
+        self.flow_wave = WaveDetector("flow", can_confirm=self.mp is None)
+        self._last_hand: HandSample | None = None
         self._last_motion = -1e9
         self._last_light = -1e9
         self._face_change_at = -1e9
@@ -159,7 +152,6 @@ class VisionEngine:
         self._away_since: float | None = None
         self._looking = None              # None unknown, True at Miko, False away
         self._last_attention = -1e9
-        self._jolts: deque = deque(maxlen=20)
         self._had_face = False
         self.covered = False
         self._dark_since: float | None = None
@@ -213,6 +205,7 @@ class VisionEngine:
             return out
 
         rich: list[dict[str, Any]] = []
+        obs = None
         # Presence and position: the OpenCV detector finds faces at any
         # distance. MediaPipe adds expressions/gaze/hands when it sees them.
         scale = PROCESS_WIDTH / float(w)
@@ -241,6 +234,7 @@ class VisionEngine:
             self.people = self.crowd.count
         else:
             face = self._pick(detected)
+        self._raw_face = face
         if (face is not None) != self._had_face:
             self._had_face = face is not None
             self._face_change_at = now
@@ -269,24 +263,57 @@ class VisionEngine:
                 self._smooth = None
                 out.append(self._event(now, "left"))
 
-        if self.seen and self.face is not None and self.mp is None:
+        # Device / camera motion first: it decides whether the rest of the
+        # scene-relative perception can be trusted on this frame.
+        out.extend(self._motion_step(gray, now))
+        stable = self.camera_stable
+        if self.seen and self.face is not None and self.mp is None and stable:
             out.extend(self._attention_step(now))
             self._size_hist.append((now, self.face.w))
             old = [s for t, s in self._size_hist if now - t >= 1.2]
             if old and self.face.w > old[-1] * 1.45 and now - self._last_approach > 6.0:
                 self._last_approach = now
                 out.append(self._event(now, "approached"))
-        out.extend(self._motion_step(gray, now))
+        elif not stable:
+            self._size_hist.clear()
+        if obs is not None and obs.hands_checked:
+            out.extend(self._hand_wave_step(obs.hands, now, stable))
         out.extend(self._scene_change_step(gray, now))
+        if not stable and self.face_analyzer is not None:
+            self.face_analyzer.camera_moved()
         for event in rich:
             name = event.pop("event")
-            if name == "wave":
-                if now - self._last_wave < WAVE_COOLDOWN_S or any(e["event"] == "wave" for e in out):
-                    continue
-                self._last_wave = now
-                self._wave.clear()
+            if not stable and name in POSE_EVENTS:
+                throttled("pose_" + name, 3.0, "PERCEPTION", name, decision="suppressed",
+                          suppression="camera_or_device_moving")
+                continue
             out.append(self._event(now, name, **event))
         return out
+
+    # ------------------------------------------------------------ waves
+    def _face_sample(self, now: float) -> FaceSample | None:
+        if not self.seen or self.face is None:
+            return None
+        f = self.face
+        return FaceSample(now, f.cx, f.cy, f.w, f.h)
+
+    def _hand_wave_step(self, hands: list, now: float, stable: bool) -> list[dict[str, Any]]:
+        """Wave evidence from MediaPipe hand landmarks."""
+        sample = None
+        if hands:
+            # Follow the same hand between frames; else the most certain one.
+            def position(h):
+                return h.center if h.center else h.wrist
+            if self._last_hand is not None:
+                last = self._last_hand
+                hand = min(hands, key=lambda h: (position(h)[0] - last.x) ** 2 + (position(h)[1] - last.y) ** 2)
+            else:
+                hand = max(hands, key=lambda h: h.score * max(h.size, 0.05))
+            x, y = position(hand)
+            sample = HandSample(now, float(x), float(y), float(hand.size or 0.1), float(hand.openness), hand.gesture)
+        self._last_hand = sample
+        return [self._event(now, e.pop("event"), **e)
+                for e in self.hand_wave.update(now, sample, self._face_sample(now), stable)]
 
     # ------------------------------------------------------------ attention
     def _attention_step(self, now: float) -> list[dict[str, Any]]:
@@ -320,7 +347,9 @@ class VisionEngine:
         """Something in the room changed and stayed changed (an object put
         down or taken away, a chair moved, a door opened)."""
         g = gray.astype(np.float32)
-        if self._bg is None or self._bg.shape != g.shape or now - self._last_light < 3.0:
+        if (self._bg is None or self._bg.shape != g.shape or now - self._last_light < 3.0
+                or not self.camera_stable):
+            # The camera moved: the old background no longer lines up.
             self._bg = g
             self._scene_since = None
             return []
@@ -367,8 +396,8 @@ class VisionEngine:
             self._dark_since = self._dark_since if self._dark_since is not None else now
             if not self.covered and now - self._dark_since >= 0.5:
                 self.covered = True
-                self._wave.clear()
-                self._shake.clear()
+                self.hand_wave.reset("lens covered")
+                self.flow_wave.reset("lens covered")
                 out.append(self._event(now, "covered"))
         else:
             self._dark_since = None
@@ -381,7 +410,7 @@ class VisionEngine:
             else:
                 self._light_hist.append((now, mean))
                 older = [m for t, m in self._light_hist if 0.8 <= now - t <= 2.0]
-                if older and now - self._last_light > 8.0:
+                if older and now - self._last_light > 8.0 and self.camera_stable:
                     before = sum(older) / len(older)
                     if abs(mean - before) > max(30.0, 0.35 * before):
                         self._last_light = now
@@ -390,80 +419,137 @@ class VisionEngine:
         return out
 
     # ------------------------------------------------------------ motion
+    def _background_mask(self, shape):
+        """Pixels that belong to the room, not to the person: the face box
+        widened to the shoulders and everything below it (the body)."""
+        H, W = shape
+        mask = np.ones((H, W), np.float32)
+        # Both the raw detection and the smoothed track: a fast head lags
+        # the smoothed box.
+        for f in (self.face if self.seen else None, self._raw_face):
+            if f is None:
+                continue
+            x0, x1 = int((f.cx - 1.2 * f.w) * W), int((f.cx + 1.2 * f.w) * W)
+            y0 = int((f.cy - 1.0 * f.h) * H)
+            mask[max(0, y0):, max(0, x0):max(0, x1)] = 0.0
+        return mask
+
+    def _global_motion(self, prev, gray) -> tuple[tuple[float, float], float]:
+        """How far the room moved since the last frame (camera or device
+        motion), and how much to trust it (0..1). Measured on the background
+        only: a head moving in front of a plain wall, or a hand moving over a
+        still room, is not the camera moving."""
+        H, W = gray.shape
+        if self._hann is None or self._hann.shape != gray.shape:
+            self._hann = cv2.createHanningWindow((W, H), cv2.CV_32F)
+        mask = self._background_mask(gray.shape)
+        share = float(mask.mean())
+        if share < 0.25:
+            return (0.0, 0.0), 0.0                 # the person fills the view: unknowable
+        room = mask > 0.5
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        textured = float((cv2.magnitude(gx, gy)[room] > 24.0).mean())
+        if textured < 0.06:
+            return (0.0, 0.0), 0.0                 # featureless background (plain wall): unknowable
+        window = self._hann * cv2.blur(mask, (9, 9))
+        (sx, sy), response = cv2.phaseCorrelate(prev.astype(np.float32), gray.astype(np.float32), window)
+        shift = math.hypot(sx, sy)
+        if shift < 0.5:
+            return (0.0, 0.0), 0.0
+        # Does shifting the whole previous frame explain the new one (on the
+        # background)? It does when the camera moved; it does not when only
+        # something in front of a still room moved.
+        m = max(2, int(math.ceil(shift)) + 2)
+        if 2 * m >= min(H, W):
+            return (0.0, 0.0), 0.0
+        inner = room[m:-m, m:-m]
+        if not inner.any():
+            return (0.0, 0.0), 0.0
+        diff = cv2.absdiff(prev, gray)
+        raw = float(diff[m:-m, m:-m][inner].mean())
+        if response > 0.08:
+            moved = cv2.warpAffine(prev, np.float32([[1, 0, sx], [0, 1, sy]]), (W, H), borderMode=cv2.BORDER_REPLICATE)
+            aligned = float(cv2.absdiff(moved, gray)[m:-m, m:-m][inner].mean())
+            if raw > 2.0 and aligned < 0.6 * raw:
+                return (sx, sy), 1.0
+        # A fast move blurs the image so phase correlation cannot lock on; if
+        # nearly the whole room changed at once, it was the camera.
+        if float((diff[room] > 25).mean()) > 0.55:
+            return (sx, sy), 0.6
+        return (0.0, 0.0), 0.0
+
     def _motion_step(self, gray, now: float) -> list[dict[str, Any]]:
-        """Camera shake (whole image moves), waves and other movement."""
+        """Device/camera motion (physical episodes), then waves and other
+        movement relative to a steady background."""
         prev, self._prev_gray = self._prev_gray, gray
         if prev is None or prev.shape != gray.shape:
             return []
         H, W = gray.shape
         out = []
-        # Global motion (computer/camera moved): phase correlation measures
-        # how far the whole image shifted, even for large, fast jumps; a big
-        # share of changed pixels catches blurry shakes it cannot lock onto.
-        if self._hann is None or self._hann.shape != gray.shape:
-            self._hann = cv2.createHanningWindow((W, H), cv2.CV_32F)
-        (sx, sy), response = cv2.phaseCorrelate(prev.astype(np.float32), gray.astype(np.float32), self._hann)
-        shift = math.hypot(sx, sy)
-        global_move = False
-        if response > 0.08 and shift > 1.2:
-            # Does shifting the whole previous frame explain the new one? It
-            # does when the camera moved; it does not when only a hand moved
-            # over a still room (shifting the room then makes things worse).
-            m = max(2, int(math.ceil(shift)) + 2)
-            moved = cv2.warpAffine(prev, np.float32([[1, 0, sx], [0, 1, sy]]), (W, H), borderMode=cv2.BORDER_REPLICATE)
-            raw = float(cv2.absdiff(prev, gray)[m:-m, m:-m].mean())
-            aligned = float(cv2.absdiff(moved, gray)[m:-m, m:-m].mean())
-            global_move = raw > 2.0 and aligned < 0.6 * raw
-        if global_move:
-            axis = sx if abs(sx) >= abs(sy) else sy
-            self._shake.add(now, axis if shift > 1.2 else 0.0)
-            self._jolts.append(now)
-            jolts = sum(1 for t in self._jolts if now - t <= 1.2)
-            if (self._shake.reversals(now, 1.2) >= 2 or jolts >= 5) and now - self._last_shake > 4.0:
-                self._last_shake = now
-                self._shake.clear()
-                self._jolts.clear()
-                self._wave.clear()
-                out.append(self._event(now, "shaken"))
+        vector, quality = self._global_motion(prev, gray)
+        physical = self.physical.update(now, vector, quality)
+        if now < self.imu_active_until:
+            # The device IMU measures its own motion better than the camera;
+            # the camera episode then only gates perception.
+            for event in physical:
+                debug("PHYSICAL", "camera episode left to the IMU", event=event["event"])
+        else:
+            for event in physical:
+                name = event.pop("event")
+                out.append(self._event(now, name, **event))
+        was_stable = self.camera_stable
+        self.camera_stable = self.physical.stable(now) and now >= self.imu_unstable_until
+        if was_stable != self.camera_stable:
+            debug("PERCEPTION", "camera " + ("steady" if self.camera_stable else "moving"),
+                  energy=self.physical.energy)
+        if not self.camera_stable:
             self._quiet = False
+            self.flow_wave.update(now, None, None, camera_stable=False)
             return out                          # local motion is meaningless now
-        self._shake.add(now, 0.0)
+
         flow = cv2.calcOpticalFlowFarneback(prev, gray, None, 0.5, 2, 11, 2, 5, 1.1, 0)
         gx = float(np.median(flow[..., 0]))
         gy = float(np.median(flow[..., 1]))
-
         # Local motion relative to the background.
         local_x = flow[..., 0] - gx
         local_y = flow[..., 1] - gy
         local = np.hypot(local_x, local_y)
         moving = local > 1.2
-        if self.face is not None and self.seen:
+        f = self.face if self.seen else None
+        if f is not None:
             # Head movement is not a gesture: ignore the face box.
-            f = self.face
             x0, x1 = int((f.cx - 0.7 * f.w) * W), int((f.cx + 0.7 * f.w) * W)
             y0, y1 = int((f.cy - 0.8 * f.h) * H), int((f.cy + 0.9 * f.h) * H)
             moving[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = False
         area = float(moving.mean())
         self._quiet = area < 0.02
-        if area < 0.006:
-            self._wave.add(now, 0.0)
-            return out
-        vx = float(np.median(local_x[moving]))
-        vy = float(np.median(np.abs(local_y[moving])))
-        ys, xs = np.nonzero(moving)
-        cx = float(xs.mean()) / W
-        # A hand: a modest area moving mostly sideways, back and forth.
-        if 0.006 <= area <= 0.65 and abs(vx) > 0.9 * vy:
-            self._wave.add(now, vx)
-        else:
-            self._wave.add(now, 0.0)
-        if self._wave.reversals(now, 1.0) >= WAVE_MIN_REVERSALS and now - self._last_wave >= WAVE_COOLDOWN_S:
-            self._last_wave = now
-            self._wave.clear()
-            # Image left is the owner's right (the camera faces them).
-            out.append(self._event(now, "wave", hand="right" if cx < 0.5 else "left"))
-        elif (area > 0.12 and now - self._last_motion > 6.0 and now - self._last_wave > 2.0
-              and now - self._face_change_at > 1.5):
+        sample = None
+        cx = 0.5
+        if area >= 0.004:
+            ys, xs = np.nonzero(moving)
+            cx = float(xs.mean()) / W
+            # The hand is the largest moving blob outside the face; its
+            # position over time is the evidence (velocity integration
+            # aliases at webcam frame rates).
+            blobs = cv2.dilate(moving.astype(np.uint8), np.ones((3, 3), np.uint8))
+            count, labels, stats, centers = cv2.connectedComponentsWithStats(blobs, connectivity=8)
+            if count > 1:
+                index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                blob_area = stats[index, cv2.CC_STAT_AREA] / float(W * H)
+                if 0.004 <= blob_area <= 0.5:
+                    blob = (labels == index) & moving
+                    if blob.any():
+                        vx = float(np.median(local_x[blob]))
+                        vy = float(np.median(np.abs(local_y[blob])))
+                        if abs(vx) > 0.9 * vy:            # mostly sideways
+                            bx, by = float(centers[index][0]) / W, float(centers[index][1]) / H
+                            sample = HandSample(now, bx, by, 0.1, -1.0, "", bx)
+        events = self.flow_wave.update(now, sample, self._face_sample(now), camera_stable=True)
+        for event in events:
+            out.append(self._event(now, event.pop("event"), **event))
+        if (not events and area > 0.12 and now - self._last_motion > 6.0
+                and now - self.flow_wave._last_confirm > 2.0 and now - self._face_change_at > 1.5):
             # Something big moved (someone walked by, the owner stood up).
             self._last_motion = now
             out.append(self._event(now, "motion", x=round(-(cx * 2 - 1), 2)))
@@ -527,6 +613,7 @@ class VisionService:
         self._last_state_at = 0.0
         self._last_state: dict[str, Any] = {}
         self._device_frames_at = 0.0
+        self._imu: ImuInterpreter | None = None
 
     def _load_enabled(self) -> bool:
         if os.environ.get("MIKO_VISION", "").strip() == "0":
@@ -684,6 +771,40 @@ class VisionService:
         self._device_frames_at = time.monotonic()
         self.feed_frame(frame, self._device_frames_at)
 
+    def feed_imu(self, samples, now: float | None = None) -> None:
+        """Motion samples from the paired device's IMU: (t, ax, ay, az, gx,
+        gy, gz) with accel in g and gyro in deg/s. Works with the camera off:
+        it is the device's sense of being moved, not sight."""
+        now = time.monotonic() if now is None else now
+        events: list[dict[str, Any]] = []
+        with self.lock:
+            if self._imu is None:
+                self._imu = ImuInterpreter()
+                log("PHYSICAL", "device IMU connected; it is now the shake source")
+            last_t = None
+            for sample in samples:
+                events.extend(self._imu.update(sample))
+                last_t = float(sample[0])
+            if self.engine is not None and last_t is not None:
+                self.engine.imu_active_until = now + 2.0
+                if not self._imu.detector.stable(last_t):
+                    self.engine.imu_unstable_until = now + 0.3
+        self._publish(events)
+
+    def _publish(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            message = {"type": "vision_event", **event}
+            log("PERCEPTION", "event " + str(event.get("event")),
+                **{k: v for k, v in event.items() if k != "event" and isinstance(v, (int, float, str))})
+            # The host decides the response level first and annotates the
+            # event ("level"), so the body in Godot reacts at the same level.
+            if self.react:
+                try:
+                    self.react(message)
+                except Exception as error:  # never let a reaction kill the camera loop
+                    log("RECOVERY", "vision reaction failed", error=type(error).__name__)
+            self.emit(message)
+
     def feed_frame(self, frame, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         with self.lock:
@@ -691,15 +812,7 @@ class VisionService:
                 return
             events = self.engine.process(frame, now)
             state = self.engine.state()
-        for event in events:
-            message = {"type": "vision_event", **event}
-            self.emit(message)
-            print("MIKO VISION EVENT:", event["event"], flush=True)
-            if self.react:
-                try:
-                    self.react(message)
-                except Exception as error:  # never let a reaction kill the camera loop
-                    print("MIKO VISION: reaction failed:", type(error).__name__)
+        self._publish(events)
         changed = state.get("seen") != self._last_state.get("seen")
         if changed or now - self._last_state_at >= STATE_INTERVAL_S:
             self._last_state_at = now

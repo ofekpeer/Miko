@@ -1,4 +1,6 @@
 extends Node3D
+const MikoLog = preload("res://miko_log.gd")
+const BehaviorArbiter = preload("res://characters/robot/behavior_arbiter.gd")
 ## Miko robot: a free-roaming companion with a live visor face.
 ##
 ## main.tscn instances this scene as "MikoScene" (Model = RobotMiko.glb). The
@@ -42,6 +44,14 @@ const BEHAVIORS := {
 	"little_dance": [0.3, 120.0], "turn_around": [0.4, 60.0], "wave_user": [0.22, 200.0],
 	"sit_rest": [0.45, 80.0], "hum_bob": [0.6, 30.0],
 }
+
+## Frame heartbeat and current update step, read by the controller watchdog.
+var frame_serial := 0
+var stage := "init"
+## Decides how big a reaction to a perception event is (see behavior_arbiter.gd).
+var arbiter = BehaviorArbiter.new()
+var _state_now: Dictionary = {}
+var debug_halt := false
 
 ## State overrides for previews/tests (same keys as _read_state()).
 var manual_state: Dictionary = {}
@@ -241,20 +251,75 @@ func _process(delta: float) -> void:
 	if not _materials_ready:
 		_apply_materials()
 		_materials_ready = true
+	# A long hitch (window dragged, GPU stall) must not fling the body.
+	delta = minf(delta, 0.1)
 	_clock += delta
+	# `stage` names the step in progress: if a step ever fails, the frame
+	# heartbeat stops and the controller's watchdog logs where and recovers.
+	stage = "read_state"
 	var state := _read_state()
+	_state_now = state
+	stage = "engagement"
 	_update_engagement(delta, state)
+	stage = "cues"
 	_update_cues(state)
+	stage = "command"
 	_update_command(delta)
+	stage = "reactions"
 	_update_reactions(delta)
+	stage = "behavior"
 	_update_behavior(delta, state)
+	stage = "locomotion"
 	_update_locomotion(delta)
+	if not (is_finite(_pos.x) and is_finite(_pos.y) and is_finite(_yaw) and is_finite(_speed) and is_finite(_lean)):
+		# A non-finite value would make the body vanish or freeze without any
+		# script error, so the heartbeat could not see it: reset explicitly.
+		recover("non-finite body state")
+		_pos = HOME
+		_yaw = 0.0
+		_lean = 0.0
+	stage = "gesture_clock"
 	if _gesture != "":
-		_gesture_t += delta / _gesture_len
+		_gesture_t += delta / maxf(_gesture_len, 0.1)
 		if _gesture_t >= 1.0:
 			_gesture = ""
+			arbiter.gesture_finished()
+	stage = "pose"
+	if debug_halt:
+		return                          # test hook: simulates a step that fails every frame
 	_compose_pose(delta, state)
+	stage = "face"
 	_update_face(delta, state)
+	stage = "done"
+	frame_serial += 1
+
+
+## Deterministic way out of any stuck behaviour: drop every transient
+## action/reaction state and return to a calm idle. Memory-free and safe to
+## call at any time (the controller's watchdog calls it if frames stall).
+func recover(reason: String) -> void:
+	MikoLog.info("RECOVERY", "robot reset to idle", {"reason": reason, "stage": stage})
+	_gesture = ""
+	_gesture_t = 0.0
+	_gesture_queue.clear()
+	_reaction_queue.clear()
+	_command = ""
+	_command_left = 0.0
+	_walking = false
+	_backward = false
+	_spin_left = 0.0
+	_speed = 0.0
+	_yaw_vel = 0.0
+	_blind = false
+	_dizzy_left = 0.0
+	_plop_left = 0.0
+	_surprise_left = 0.0
+	_sleep_walk = false
+	if not _sit_hold:
+		_sit_goal = 0.0
+	_behavior = "idle_pause"
+	_behavior_left = 2.0
+	stage = "recovered"
 
 
 # ------------------------------------------------------------------ attention / conversation
@@ -290,7 +355,8 @@ func _on_conversation_start() -> void:
 		_walk_to(HOME + Vector2(_rng.randf_range(-0.35, 0.35), _rng.randf_range(-0.1, 0.15)))
 	else:
 		_walking = false
-	if away > 90.0:
+	if away > 90.0 and arbiter.family_ready("greeting", _clock):
+		arbiter.note_autonomous("greeting", _clock, 20.0)
 		_queue_gesture("wave", 2.3, 0.0, true)
 
 
@@ -340,7 +406,7 @@ func on_vision(event: Dictionary) -> void:
 		return
 	# People need a moment to notice and respond; startling things are faster.
 	var kind := str(event.get("event", ""))
-	var delay := _rng.randf_range(0.08, 0.22) if kind in ["covered", "shaken", "surprised", "uncovered"] \
+	var delay := _rng.randf_range(0.08, 0.22) if kind in ["covered", "shaken", "shake_started", "surprised", "uncovered", "orientation_changed"] \
 		else _rng.randf_range(0.18, 0.6)
 	_reaction_queue.append([_clock + delay, event])
 
@@ -362,6 +428,68 @@ func _update_reactions(delta: float) -> void:
 func _react(event: Dictionary) -> void:
 	var kind := str(event.get("event", ""))
 	var busy := _command != "" and _command not in ["sit", "look_around"]
+	var decision: Dictionary = arbiter.decide(kind, event, {
+		"now": _clock, "user_speaking": bool(_state_now.get("listening", false)),
+		"miko_speaking": bool(_state_now.get("speaking", false)) or bool(_state_now.get("thinking", false)),
+		"gesture_active": _gesture != "", "busy_command": busy})
+	var level: int = int(decision.get("level", 0))
+	# World state changes apply at every level; only the visible reaction is
+	# scaled (an "uncovered" that only gets a glance must still end blindness).
+	if kind == "covered":
+		_blind = true
+	elif kind == "uncovered":
+		_blind = false
+	if level <= 0:
+		return
+	if level == 1:
+		_micro_react(kind, event)
+		return
+	# FACIAL: the face reacts, the body keeps doing what it was doing.
+	var body_before := [_gesture, _gesture_t, _gesture_len, _gesture_side, _gesture_amp, _gesture_queue.duplicate()]
+	_react_full(kind, event, busy)
+	if level == 2:
+		_gesture = body_before[0]
+		_gesture_t = body_before[1]
+		_gesture_len = body_before[2]
+		_gesture_side = body_before[3]
+		_gesture_amp = body_before[4]
+		_gesture_queue = body_before[5]
+
+
+## The smallest visible acknowledgement: eyes and attention only, no gesture.
+func _micro_react(kind: String, event: Dictionary) -> void:
+	match kind:
+		# Faces mirror faces, quickly and subtly, even when the body stays put.
+		"smiled", "laughing":
+			_joy_left = maxf(_joy_left, 1.5)
+		"frowned":
+			_concern_left = maxf(_concern_left, 3.0)
+		"winked":
+			_wink_left = 0.45
+		"surprised":
+			_surprise_left = maxf(_surprise_left, 0.8)
+		"yawned", "eyes_closed":
+			_sleepy_left = maxf(_sleepy_left, 2.0)
+		"shake_active":
+			_dizzy_left = maxf(_dizzy_left, 1.2)        # still being shaken: keep wobbling
+		"device_moved", "device_nudged":
+			_surprise_left = maxf(_surprise_left, 0.35)
+		"motion", "scene_changed", "light_changed":
+			if not _asleep:
+				var side := clampf(float(event.get("x", 0.0)), -1.0, 1.0)
+				_look_point = _camera_local() + Vector3(side * 1.6, -0.3, 0.0)
+				_look_user = false
+				_look_wait = 1.6
+		"looked_away", "left", "someone_left", "looked_somewhere", "tilted_head":
+			if not _asleep:
+				_look_wait = minf(_look_wait, 0.4)
+		_:
+			if not _asleep:
+				_look_user = true
+				_look_wait = 1.5
+
+
+func _react_full(kind: String, event: Dictionary, busy: bool) -> void:
 	match kind:
 		"wave":
 			# Wave back the way a person would, a little differently each time.
@@ -439,21 +567,21 @@ func _react(event: Dictionary) -> void:
 				_:
 					_queue_gesture("tilt", 1.0, 0.0, true)
 					_gesture_queue.append(["wave", 1.8])
-		"shaken":
-			# The world shook: loses balance, wobbles, then copes its own way.
+		"shake_started", "shaken":
+			# The world started shaking: loses balance and wobbles while it lasts.
 			_wake_for_reaction()
 			_walking = false
 			_surprise_left = 1.2
 			_dizzy_left = 3.2
 			_queue_gesture("wobble", 2.2, 0.0, true)
-			match _variant(kind, 3):
-				0:
-					_gesture_queue.append(["shake_head", 1.1])
-				1:
-					_plop_left = 2.6                # sits down hard, then gets up
-					_sit_goal = 1.0
-				_:
-					_gesture_queue.append(["laugh", 1.5])
+			if kind == "shaken":
+				_after_shake(2.0)
+		"shake_ended":
+			_after_shake(float(event.get("duration", 1.0)))
+		"orientation_changed":
+			_wake_for_reaction()
+			_surprise_left = 1.4
+			_queue_gesture(["startle", "tilt"][_variant(kind, 2)], 1.2, 0.0, true)
 		"light_changed":
 			if not busy:
 				_surprise_left = 1.0
@@ -551,6 +679,31 @@ func _react(event: Dictionary) -> void:
 				_surprise_left = 0.8 if kind == "scene_changed" else 0.5
 				if kind == "scene_changed":
 					_queue_gesture("tilt", 1.4)
+
+
+## Once the shaking stops it copes its own way; bigger shakes, bigger recovery.
+## While the wobble is still playing, the recovery follows it.
+func _after_shake(duration: float) -> void:
+	_dizzy_left = maxf(_dizzy_left, clampf(duration, 0.8, 3.0))
+	var follow := _gesture == "wobble"
+	var pick := ""
+	if duration < 1.2:
+		pick = ["shake_head", "tilt"][_variant("shake_ended_short", 2)]
+	else:
+		match _variant("shake_ended", 3):
+			0:
+				pick = "shake_head"
+			1:
+				_plop_left = 2.6                # sits down hard, then gets up
+				_sit_goal = 1.0
+				return
+			_:
+				pick = "laugh"
+	var length := 1.1 if pick != "laugh" else 1.5
+	if follow:
+		_gesture_queue.append([pick, length])
+	else:
+		_queue_gesture(pick, length, 0.0, true)
 
 
 func _react_hand(gesture: String, event: Dictionary, busy: bool) -> void:
@@ -722,6 +875,8 @@ func _choose_behavior(state: Dictionary) -> void:
 		var weight: float = BEHAVIORS[name][0]
 		if _cooldowns.get(name, -999.0) > _clock:
 			continue
+		if name == "wave_user" and not arbiter.family_ready("greeting", _clock):
+			continue                            # just greeted for real: no idle wave on top
 		if not _history.is_empty() and _history[-1] == name:
 			continue
 		if _history.count(name) >= 2:
@@ -789,6 +944,7 @@ func _start_behavior(name: String) -> void:
 			_behavior_left = 3.0
 			_spin_left = TAU * (1.0 if _rng.randf() < 0.5 else -1.0)
 		"wave_user":
+			arbiter.note_autonomous("greeting", _clock, 30.0)
 			_behavior_left = 3.0
 			_look_user = true
 			_face_yaw_goal = _yaw_toward(_camera_local())
@@ -1043,6 +1199,10 @@ func _update_locomotion(delta: float) -> void:
 func _queue_gesture(name: String, length: float, side: float = 0.0, important: bool = false) -> void:
 	if _gesture != "" and not important:
 		return
+	if important:
+		# Reactions and commands (not speech beats or idle life) are logged.
+		MikoLog.info("ANIMATION", name, {"replaces": _gesture if _gesture != "" else "-",
+			"queued": _gesture_queue.size(), "command": _command if _command != "" else "-"})
 	_gesture = name
 	_gesture_t = 0.0
 	_gesture_len = maxf(0.3, length * _rng.randf_range(0.9, 1.15))

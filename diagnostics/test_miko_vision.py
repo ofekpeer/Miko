@@ -45,6 +45,12 @@ def frame(face_x=240, hand=None):
     return img
 
 
+def opencv_engine():
+    """The OpenCV-only path (no MediaPipe): the synthetic textured "hand" is
+    not a hand to a landmark model, so flow evidence is what is tested."""
+    return miko_vision.VisionEngine(use_mediapipe=False)
+
+
 def run(engine, frames, fps=11.0, start=0.0):
     events = []
     for i, f in enumerate(frames):
@@ -64,14 +70,14 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(engine.summary()["where"], "owner's right side")
 
     def test_wave_beside_face_is_detected_once(self):
-        engine = miko_vision.VisionEngine()
+        engine = opencv_engine()
         run(engine, [frame()] * 4)
         waving = [frame(hand=(470 + 45 * math.sin(i * 2 * math.pi / 5.0), 150)) for i in range(26)]
         events = run(engine, waving, start=1.0)
         self.assertEqual(events.count("wave"), 1, events)
 
     def test_big_hand_close_to_the_camera_is_a_wave_not_a_shake(self):
-        engine = miko_vision.VisionEngine()
+        engine = opencv_engine()
         run(engine, [frame()] * 4)
         big = cv2.resize(HAND, (200, 260))
         frames = []
@@ -94,7 +100,7 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(events.count("scene_changed"), 1)
 
     def test_still_hand_and_vertical_motion_are_not_waves(self):
-        engine = miko_vision.VisionEngine()
+        engine = opencv_engine()
         run(engine, [frame()] * 4)
         still = [frame(hand=(480, 150))] * 15
         vertical = [frame(hand=(480, 150 + 40 * math.sin(i * 2 * math.pi / 5.0))) for i in range(26)]
@@ -102,20 +108,20 @@ class VisionTests(unittest.TestCase):
         self.assertNotIn("wave", events)
 
     def test_whole_person_moving_is_not_a_wave(self):
-        engine = miko_vision.VisionEngine()
+        engine = opencv_engine()
         run(engine, [frame()] * 4)
         sway = [frame(face_x=int(240 + 60 * math.sin(i * 2 * math.pi / 5.0))) for i in range(26)]
         self.assertNotIn("wave", run(engine, sway, start=1.0))
 
     def test_wave_detected_even_while_the_head_moves(self):
-        engine = miko_vision.VisionEngine()
+        engine = opencv_engine()
         run(engine, [frame()] * 4)
         waving = [frame(face_x=int(240 + 6 * math.sin(i)), hand=(470 + 45 * math.sin(i * 2 * math.pi / 5.0), 150))
                   for i in range(26)]
         self.assertIn("wave", run(engine, waving, start=1.0))
 
     def test_shaking_the_camera_is_noticed_and_is_not_a_wave(self):
-        engine = miko_vision.VisionEngine()
+        engine = opencv_engine()
         run(engine, [frame()] * 4)
         base = frame()
         shaken = []
@@ -124,8 +130,16 @@ class VisionTests(unittest.TestCase):
             dy = int(6 * math.cos(i * 2 * math.pi / 4.0))
             shaken.append(np.roll(np.roll(base, dx, axis=1), dy, axis=0))
         events = run(engine, shaken, start=1.0)
-        self.assertIn("shaken", events)
+        self.assertEqual(events.count("shake_started"), 1, events)
         self.assertNotIn("wave", events)
+        self.assertFalse(engine.camera_stable)          # waves/room changes are suspended meanwhile
+
+    @unittest.skipUnless(miko_vision.miko_perception and miko_vision.miko_perception.available(), "MediaPipe not installed")
+    def test_with_a_hand_model_flow_alone_never_confirms_a_wave(self):
+        engine = miko_vision.VisionEngine()           # MediaPipe: hand landmarks are required
+        run(engine, [frame()] * 4)
+        waving = [frame(hand=(470 + 45 * math.sin(i * 2 * math.pi / 5.0), 150)) for i in range(26)]
+        self.assertNotIn("wave", run(engine, waving, start=1.0))
 
     def test_covering_and_uncovering_the_lens(self):
         engine = miko_vision.VisionEngine()
@@ -160,7 +174,7 @@ class VisionTests(unittest.TestCase):
     def test_service_emits_state_and_reacts_to_wave(self):
         emitted, reactions = [], []
         service = miko_vision.VisionService(emitted.append, reactions.append, settings_path="/nonexistent/x.json")
-        service.engine = miko_vision.VisionEngine()
+        service.engine = opencv_engine()
         for i in range(4):
             service.feed_frame(frame(), i / 11.0)
         for i in range(26):
@@ -175,9 +189,9 @@ class VisionTests(unittest.TestCase):
 
 class GreetingTests(unittest.TestCase):
     def _hub(self, history_at=0.0):
-        import asyncio  # noqa: F401
         import threading
         import miko_realtime
+        from miko_behavior import ResponsePolicy
 
         class Brain:
             state_lock = threading.Lock()
@@ -186,6 +200,7 @@ class GreetingTests(unittest.TestCase):
         class Native:
             def __init__(self):
                 self.api, self.responding, self.input_bytes, self.calls = object(), False, 0, []
+                self.ptt_active, self.active_response_id, self.pending_responses = False, "", {}
 
             async def spontaneous(self, note):
                 self.calls.append(note)
@@ -194,32 +209,57 @@ class GreetingTests(unittest.TestCase):
             async def ensure_session(self):
                 self.api = object()
 
+        class AlwaysTalk:
+            def random(self):
+                return 0.0
+
         hub = miko_realtime.RealtimeHub.__new__(miko_realtime.RealtimeHub)
         hub.browser_id, hub.vision_spoken_at, hub.brain = None, 0.0, Brain()
-        hub.vision_talk_chance = {k: 1.0 for k in miko_realtime.RealtimeHub.VISION_TALK_CHANCE}
+        hub.perception_policy = ResponsePolicy(rng=AlwaysTalk())
+        hub.loop = None
         native = Native()
         hub.native = {native}
         return hub, native
 
-    def test_wave_greets_once_in_open_idle_session(self):
+    def react(self, hub, event):
         import asyncio
-        hub, native = self._hub()
-        asyncio.run(hub._vision_greeting({"event": "wave"}))
-        asyncio.run(hub._vision_greeting({"event": "wave"}))     # cooldown
-        self.assertEqual(len(native.calls), 1)
-        self.assertIn("מנופף", native.calls[0])
+        decision = hub.vision_reaction(dict(event))
+        asyncio.run(hub._vision_greeting(dict(event), decision))
+        return decision
 
-    def test_no_greeting_while_busy_closed_or_mid_conversation(self):
-        import asyncio
+    def test_wave_greets_once_then_the_body_alone_reacts(self):
+        hub, native = self._hub()
+        first = self.react(hub, {"event": "wave", "confidence": 0.93})
+        second = self.react(hub, {"event": "wave", "confidence": 0.95})      # cooldown
+        self.assertEqual(first.name, "SHORT_VOCAL")
+        self.assertEqual(second.name, "ANIMATION_ONLY")
+        self.assertEqual(len(native.calls), 1)
+        self.assertTrue(native.calls[0].startswith("[perception] "))
+        self.assertNotIn("נופף", native.calls[0])                    # nothing Hebrew to echo
+
+    def test_low_confidence_wave_gets_no_reaction_beyond_a_glance(self):
+        hub, native = self._hub()
+        decision = self.react(hub, {"event": "wave", "confidence": 0.55})
+        self.assertEqual(decision.name, "MICRO")
+        self.assertEqual(native.calls, [])
+
+    def test_no_words_while_busy_closed_or_mid_conversation(self):
         import time
         hub, native = self._hub()
         native.responding = True
-        asyncio.run(hub._vision_greeting({"event": "wave"}))
+        self.assertEqual(self.react(hub, {"event": "wave", "confidence": 0.9}).name, "ANIMATION_ONLY")
         native.responding, native.api = False, None
-        asyncio.run(hub._vision_greeting({"event": "arrived"}))
+        self.react(hub, {"event": "arrived"})          # quiet observation never opens a session
         hub2, native2 = self._hub(history_at=time.time())
-        asyncio.run(hub2._vision_greeting({"event": "wave"}))
+        self.assertLess(self.react(hub2, {"event": "wave", "confidence": 0.9}).level, 4)
         self.assertEqual(native.calls + native2.calls, [])
+
+    def test_minor_sensor_events_never_speak(self):
+        hub, native = self._hub()
+        for kind in ("device_moved", "device_nudged", "shake_active", "motion", "scene_changed", "light_changed",
+                     "looked_away", "tilted_head"):
+            self.assertLessEqual(self.react(hub, {"event": kind}).level, 1, kind)
+        self.assertEqual(native.calls, [])
 
 
 class PerceptionContextTests(unittest.TestCase):
@@ -242,28 +282,32 @@ class PerceptionContextTests(unittest.TestCase):
         self.assertEqual(len(native.sent), 1)
         text = native.sent[0]["item"]["content"][0]["text"]
         self.assertEqual(native.sent[0]["item"]["role"], "system")
-        self.assertIn("חייך", text)
-        self.assertIn("אגודל למעלה", text)
+        self.assertIn("smiled", text)
+        self.assertIn("thumbs up", text)
         asyncio.run(hub.flush_vision_context(native))     # nothing new: nothing sent
         self.assertEqual(len(native.sent), 1)
 
 
 class PlayfulReactionTests(GreetingTests):
-    def test_covering_and_shaking_get_spoken_reactions(self):
-        import asyncio
+    def test_covering_and_a_real_shake_get_spoken_reactions(self):
         hub, native = self._hub()
-        asyncio.run(hub._vision_greeting({"event": "covered"}))
-        hub.vision_spoken_at = 0.0
-        asyncio.run(hub._vision_greeting({"event": "shaken"}))
+        self.react(hub, {"event": "covered"})
+        hub.perception_policy.last_any_vocal = -1e9        # past the social budget
+        self.react(hub, {"event": "shake_started", "confidence": 0.9})
+        self.react(hub, {"event": "shake_ended", "duration": 2.0})
         self.assertEqual(len(native.calls), 2)
-        self.assertIn("כיסה", native.calls[0])
-        self.assertIn("רעד", native.calls[1])
+        self.assertIn("covered", native.calls[0])
+        self.assertIn("shook", native.calls[1])
+
+    def test_a_brief_bump_shake_gets_body_only(self):
+        hub, native = self._hub()
+        self.assertEqual(self.react(hub, {"event": "shake_ended", "duration": 0.6}).name, "ANIMATION_ONLY")
+        self.assertEqual(native.calls, [])
 
     def test_closed_session_opens_once_for_a_wave(self):
-        import asyncio
         hub, native = self._hub()
         native.api = None
-        asyncio.run(hub._vision_greeting({"event": "wave"}))
+        self.react(hub, {"event": "wave", "confidence": 0.9})
         self.assertEqual(len(native.calls), 1)          # opened, then spoke
 
 
@@ -297,7 +341,7 @@ class SpontaneousSpeechTests(unittest.TestCase):
         import asyncio
         session, sent = self._session()
         session.state.turn_id = "turn_owner"
-        self.assertTrue(asyncio.run(session.spontaneous("[ראייה] נופפו לך")))
+        self.assertTrue(asyncio.run(session.spontaneous("[perception] The owner waved hello to you just now.")))
         self.assertEqual(sent[0]["item"]["role"], "system")
         self.assertEqual(sent[1]["type"], "response.create")
         self.assertEqual(sent[1]["response"]["tool_choice"], "none")

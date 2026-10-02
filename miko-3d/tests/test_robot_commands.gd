@@ -114,9 +114,17 @@ func _initialize() -> void:
 	await _frames(2)
 	if not _waves(robot):
 		_fail("did not wave back"); return
-	await _frames(150)
-	# Waved again: still waves back, but not the identical routine.
+	await _frames(30)
+	# Waved again right away: the same greeting family is cooling down, so
+	# only the eyes acknowledge it (no second identical wave routine).
 	var first_variant: int = robot._last_variant["wave"]
+	robot._gesture = ""
+	robot._gesture_queue.clear()
+	robot.on_vision({"type": "vision_event", "event": "wave"})
+	if _waves(robot):
+		_fail("an immediate repeat wave got a full second routine"); return
+	await _frames(200)
+	# Waved again later: waves back, but not the identical routine.
 	robot._gesture = ""
 	robot._gesture_queue.clear()
 	robot.on_vision({"type": "vision_event", "event": "wave"})

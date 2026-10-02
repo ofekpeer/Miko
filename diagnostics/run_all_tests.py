@@ -4,9 +4,11 @@
 
 1. Every GDScript must load (a parse error would otherwise hang a test).
 2. Python suites (brain tools, Realtime host, long session, vision,
-   perception, device bridge).
-3. Godot scene tests (voice client, robot commands, soak, transcript).
-4. With --e2e: the end-to-end stuck test with random camera events.
+   perception, physical/gesture events, language, device bridge).
+3. Godot scene tests (voice client, robot commands, behaviour arbiter,
+   guardian/recovery, fuzz, soak, transcript).
+4. With --e2e: the end-to-end stuck test with random camera events, rapid
+   SPACE bursts and injected STT / TTS / lost-request failures.
 """
 
 from __future__ import annotations
@@ -29,11 +31,16 @@ PY_SUITES = [
     ["test_miko_device_host.py"],
     ["test_miko_vision.py"],
     ["test_miko_perception.py"],
+    ["test_miko_events.py"],
+    ["test_miko_language.py"],
 ]
 GODOT_TESTS = {
     "tests/test_robot_commands.gd": "ROBOT_COMMANDS_OK",
     "tests/test_robot_presence.gd": "ROBOT_PRESENCE_OK",
     "tests/test_robot_soak.gd": "ROBOT_SOAK_OK",
+    "tests/test_behavior_arbiter.gd": "BEHAVIOR_ARBITER_OK",
+    "tests/test_robot_fuzz.gd": "ROBOT_FUZZ_OK",
+    "tests/test_guardian.gd": "GUARDIAN_OK",
     "tests/test_spontaneous_transcript.gd": "SPONTANEOUS_TRANSCRIPT_AND_STALL_OK",
     "test_native_transcript_order.gd": "NATIVE_TRANSCRIPT_ORIGIN_ORDER_OK",
     "tests/test_native_caption_ack.gd": "NATIVE_VISIBLE_CAPTION_ACK_OK",
@@ -97,12 +104,14 @@ def main() -> int:
             print("\n".join(line for line in out.splitlines() if "FAIL" in line or "ERROR" in line)[-2000:])
 
     if args.e2e:
-        print("== End-to-end (random camera events)")
-        code, out = run([sys.executable, str(DIAG / "e2e" / "run_e2e.py"), "--turns", "25", "--chaos", "--seed", "9"], ROOT, 1800)
-        summary = [line for line in out.splitlines() if line.startswith(("RESULT", "E2E_STUCK"))]
-        print("  " + "\n  ".join(summary))
-        if code:
-            failures.append("e2e")
+        for label, extra in (("random camera events", ["--chaos"]),
+                             ("rapid SPACE + injected STT/TTS/brain failures", ["--chaos", "--rapid", "--faults", "stt,tts,brain"])):
+            print("== End-to-end (" + label + ")")
+            code, out = run([sys.executable, str(DIAG / "e2e" / "run_e2e.py"), "--turns", "25", "--seed", "9", *extra], ROOT, 1800)
+            summary = [line for line in out.splitlines() if line.startswith(("RESULT", "E2E_STUCK"))]
+            print("  " + "\n  ".join(summary))
+            if code:
+                failures.append("e2e " + label)
 
     print("\nALL PASSED" if not failures else f"\nFAILED: {failures}")
     return 0 if not failures else 1

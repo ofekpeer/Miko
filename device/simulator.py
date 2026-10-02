@@ -26,6 +26,7 @@ from .protocol import (
     decode_downlink_pcm,
     decode_pairing_secret,
     encode_camera_jpeg,
+    encode_motion_imu,
     encode_vision_jpeg,
     encode_uplink_pcm,
     new_nonce,
@@ -102,6 +103,23 @@ async def _send_pcm(ws, pcm: bytes) -> None:
     await ws.send(json.dumps({"type": "stop"}))
 
 
+async def _send_shake(ws, seconds: float = 1.5) -> None:
+    """A synthetic IMU episode: rest, a brisk 4 Hz shake, rest (100 Hz)."""
+    import math
+    sequence, device_ms = 0, 0
+    phases = [(1.0, 0.0), (seconds, 400.0), (2.0, 0.0)]
+    for duration, amplitude in phases:
+        for _ in range(int(duration * 10)):              # 10 batches per second
+            batch = []
+            for i in range(10):
+                t = (device_ms + i * 10) / 1000.0
+                gx = amplitude * math.sin(2 * math.pi * 4 * t)
+                batch.append((i * 10, 0, 0, 1000, int(gx * 10), 0, int(amplitude * 2)))
+            await ws.send(encode_motion_imu(sequence, device_ms, batch))
+            sequence, device_ms = sequence + 1, device_ms + 100
+            await asyncio.sleep(0.1)
+
+
 async def run(args: argparse.Namespace) -> None:
     secret = decode_pairing_secret(Path(args.secret_file).read_text(encoding="ascii").strip())
     context = ssl.create_default_context(cafile=args.ca)
@@ -123,6 +141,8 @@ async def run(args: argparse.Namespace) -> None:
             vision_file = getattr(args, "vision_file", None)
             if vision_file:
                 capabilities.append("vision")
+            if getattr(args, "shake_demo", False):
+                capabilities.append("motion")
             await ws.send(json.dumps({
                 "type": "authenticate", "device_id": args.device_id,
                 "client_nonce": client_nonce,
@@ -196,6 +216,9 @@ async def run(args: argparse.Namespace) -> None:
             try:
                 await ws.send(json.dumps({"type": "configure", "mode": "ptt"}))
                 await asyncio.wait_for(ready.wait(), timeout=30)
+                if getattr(args, "shake_demo", False):
+                    print("sending a synthetic shake from the device IMU")
+                    await _send_shake(ws)
                 if args.text:
                     await ws.send(json.dumps({"type": "text", "text": args.text}))
                 elif args.wav_in:
@@ -238,6 +261,7 @@ def main() -> None:
     parser.add_argument("--speaker", action="store_true", help="play through a real speaker and acknowledge completion")
     parser.add_argument("--camera-file", help="JPEG offered only after a server request and interactive confirmation")
     parser.add_argument("--vision-file", help="small JPEG streamed as perception frames when the server asks")
+    parser.add_argument("--shake-demo", action="store_true", help="advertise the motion capability and send a synthetic IMU shake")
     parser.add_argument("--wait-seconds", type=float, default=30)
     args = parser.parse_args()
     try:

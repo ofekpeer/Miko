@@ -94,12 +94,27 @@ class HandAndCrowdTests(unittest.TestCase):
     def hand(self, x, gesture="open_palm", score=0.9, tip=(0.5, 0.3), base=(0.5, 0.4)):
         return P.HandObs(gesture, score, (x, 0.5), tip, base, "Right")
 
-    def test_open_hand_swinging_is_a_wave(self):
+    def test_a_waving_open_hand_is_not_also_a_held_gesture(self):
         a = P.HandAnalyzer()
         events = []
         for i in range(30):
-            events += [e["event"] for e in a.update([self.hand(0.6 + 0.08 * math.sin(i * 2 * math.pi / 6))], i / 15)]
-        self.assertEqual(events.count("wave"), 1)
+            events += [e.get("gesture") for e in a.update([self.hand(0.6 + 0.08 * math.sin(i * 2 * math.pi / 6))], i / 15)]
+        self.assertEqual(events, [])                 # the wave detector owns this motion
+        held = []
+        for i in range(15):
+            held += [e.get("gesture") for e in a.update([self.hand(0.6)], 3.0 + i / 15)]
+        self.assertEqual(held, ["open_palm"])
+
+    def test_hand_shape_openness_from_landmarks(self):
+        class L:
+            def __init__(self, x, y):
+                self.x, self.y = x, y
+        # Wrist at the bottom; fingers straight up (open) or curled (fist).
+        open_hand = [L(0.5, 0.8)] + [L(0.5, 0.8 - 0.05 * (i % 4 + 1)) for i in range(20)]
+        openness, size, center = P._hand_shape(open_hand)
+        self.assertEqual(openness, 1.0)
+        fist = [L(0.5, 0.8)] + [L(0.5, 0.7 if i % 4 in (1,) else 0.72) for i in range(20)]
+        self.assertLess(P._hand_shape(fist)[0], 0.5)
 
     def test_stable_gesture_once_and_pointing_direction(self):
         a = P.HandAnalyzer()

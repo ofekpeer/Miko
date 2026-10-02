@@ -22,7 +22,10 @@ from device.bridge import BridgeSettings, DeviceBridge, DeviceConfigError, Devic
 from device.protocol import (
     decode_downlink_pcm,
     encode_camera_jpeg,
+    encode_motion_imu,
+    decode_motion_imu,
     encode_vision_jpeg,
+    ProtocolError,
     encode_uplink_pcm,
     new_nonce,
     pairing_proof,
@@ -44,9 +47,13 @@ class _FakeVision:
     def __init__(self) -> None:
         self.enabled = True
         self.frames: list[bytes] = []
+        self.motion: list = []
 
     def feed_jpeg(self, jpeg: bytes) -> None:
         self.frames.append(jpeg)
+
+    def feed_imu(self, samples) -> None:
+        self.motion.extend(samples)
 
 
 class _FakeHub:
@@ -136,6 +143,21 @@ class DeviceBridgeTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_motion_frames_round_trip_and_reject_malformed(self) -> None:
+        frame = encode_motion_imu(7, 5000, [(0, 10, -20, 1000, 15, -15, 0), (10, 0, 0, 980, 0, 0, 1234)])
+        sequence, samples = decode_motion_imu(frame)
+        self.assertEqual(sequence, 7)
+        self.assertEqual(samples[1], (5.01, 0.0, 0.0, 0.98, 0.0, 0.0, 123.4))
+        with self.assertRaises(ProtocolError):
+            decode_motion_imu(frame[:-1])
+        with self.assertRaises(ProtocolError):
+            encode_motion_imu(1, 0, [])
+        with self.assertRaises(ProtocolError):
+            encode_motion_imu(1, 0, [(0, 99999, 0, 0, 0, 0, 0)])
+        backwards = encode_motion_imu(1, 0, [(10, 0, 0, 0, 0, 0, 0), (5, 0, 0, 0, 0, 0, 0)])
+        with self.assertRaises(ProtocolError):
+            decode_motion_imu(backwards)
+
     def test_listener_is_opt_in_and_rejects_public_bind(self) -> None:
         with tempfile.TemporaryDirectory(prefix="miko_device_config_") as directory:
             path = Path(directory) / "settings.json"
@@ -172,7 +194,7 @@ class DeviceBridgeTests(unittest.TestCase):
                 "tls_cert": str(cert), "tls_key": str(key),
                 "paired_devices": [{
                     "device_id": "miko_s3", "pairing_secret_b64": base64.b64encode(secret).decode("ascii"),
-                    "capabilities": ["audio", "display", "gesture", "camera", "vision"],
+                    "capabilities": ["audio", "display", "gesture", "camera", "vision", "motion"],
                 }],
             }), encoding="utf-8")
             hub = _FakeHub()
@@ -256,6 +278,25 @@ class DeviceBridgeTests(unittest.TestCase):
                     with self.assertRaises(ConnectionClosed):
                         await asyncio.wait_for(seeing.recv(), 2)
                     hub.vision.enabled = True
+
+                # IMU motion: only with the motion capability, bounded rate.
+                async with connect(url, ssl=tls) as moving:
+                    challenge = json.loads(await moving.recv())
+                    nonce = new_nonce()
+                    await moving.send(json.dumps({
+                        "type": "authenticate", "device_id": "miko_s3", "client_nonce": nonce,
+                        "proof": pairing_proof(secret, "miko_s3", challenge["server_nonce"], nonce),
+                        "capabilities": ["audio", "motion"],
+                    }))
+                    self.assertIn("motion", json.loads(await moving.recv())["capabilities"])
+                    batch = [(i * 10, 0, 0, 1000, 3000 if i % 2 else -3000, 0, 0) for i in range(20)]
+                    for i in range(15):                     # 300 samples in a burst: rate bounded
+                        await moving.send(encode_motion_imu(i, 1000 + i * 200, batch))
+                    await asyncio.sleep(0.3)
+                    self.assertGreaterEqual(len(hub.vision.motion), 20)
+                    self.assertLessEqual(len(hub.vision.motion), 200)
+                    self.assertAlmostEqual(hub.vision.motion[0][3], 1.0)        # az in g
+                    self.assertAlmostEqual(abs(hub.vision.motion[0][4]), 300.0)  # gyro in deg/s
 
                 # The same authenticated device resumes one logical session.
                 async with connect(url, ssl=tls) as resumed_device:

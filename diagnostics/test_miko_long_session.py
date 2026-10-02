@@ -170,15 +170,14 @@ class LongSessionStress(fixture.MikoFixture):
         rng = random.Random(seed)
         hub = RealtimeHub(self.brain)
         hub.loop = asyncio.get_running_loop()
-        hub.VISION_COOLDOWN = {k: 0 for k in RealtimeHub.VISION_COOLDOWN}
-        hub.vision_talk_chance = {k: 1.0 for k in RealtimeHub.VISION_TALK_CHANCE}
+        hub.perception_policy.stress_mode = True       # every event asks to speak: stress collisions
         godot = FakeGodot()
         session = NativeSession(hub, godot)
         hub.native.add(session)
         model = FakeRealtimeModel()
         session.api = model
         session.reader = asyncio.create_task(session.api_events(model))
-        events = ["wave", "covered", "uncovered", "shaken"]
+        events = ["wave", "covered", "uncovered", "shake_ended"]
 
         async def react():
             hub.vision_spoken_at = 0.0
