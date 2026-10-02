@@ -368,28 +368,50 @@ func _setup_lighting() -> void:
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.57, 0.57, 0.55)
 	env.ambient_light_energy = 0.70
-	env.reflected_light_source = Environment.REFLECTION_SOURCE_BG
+	# A soft studio sky only for reflections (the background stays a flat
+	# color): glossy plastic picks up gentle gradients instead of hard blots.
+	var sky_material := ProceduralSkyMaterial.new()
+	sky_material.sky_top_color = Color(0.86, 0.84, 0.80)
+	sky_material.sky_horizon_color = Color(0.62, 0.55, 0.48)
+	sky_material.ground_horizon_color = Color(0.40, 0.30, 0.23)
+	sky_material.ground_bottom_color = Color(0.20, 0.15, 0.12)
+	sky_material.sun_angle_max = 0.0
+	var sky := Sky.new()
+	sky.sky_material = sky_material
+	sky.radiance_size = Sky.RADIANCE_SIZE_128
+	env.sky = sky
+	env.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	env.glow_enabled = false
+	# Only the self-lit visor face exceeds the threshold, so it alone blooms.
+	env.glow_enabled = true
+	env.glow_intensity = 0.55
+	env.glow_bloom = 0.0
+	env.glow_hdr_threshold = 1.15
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
 	env.ssao_enabled = true
 	env.ssao_intensity = 0.8
 	world.environment = env
 	stage_root.add_child(world)
 
-	var key := SpotLight3D.new()
+	# Directional key: a spotlight here painted a bright oval in the middle of
+	# the desk. Even light reads as a real room and keeps soft, stable shadows.
+	var key := DirectionalLight3D.new()
 	key.name = "SoftKey"
 	stage_root.add_child(key)
 	key.position = Vector3(-1.8, 4.2, 1.25)
 	key.look_at(stage_root.to_global(Vector3(0.0, 0.8, 0.0)))
 	key.light_color = Color(1.0, 0.94, 0.86)
-	key.light_energy = 1.30
-	key.spot_range = 8.0
-	key.spot_angle = 47.0
+	key.light_energy = 0.95
 	key.light_cull_mask = 1
 	key.shadow_enabled = true
-	key.light_size = 1.55
-	key.shadow_blur = 2.7
-	key.shadow_opacity = 0.61
+	key.light_angular_distance = 1.2
+	key.shadow_blur = 1.4
+	key.shadow_bias = 0.04
+	key.shadow_normal_bias = 1.6
+	key.shadow_opacity = 0.62
+	key.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS
+	key.directional_shadow_max_distance = 9.0
+	key.directional_shadow_blend_splits = true
 
 	var fill := OmniLight3D.new()
 	fill.name = "SoftFill"

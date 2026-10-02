@@ -15,6 +15,7 @@ extends Node3D
 ## * Brain cues (wave, laugh, dance, bounce, roll, sleep, look) map to gestures.
 
 const FACE_SHADER := preload("res://characters/robot/robot_face.gdshader")
+const BODY_SHADER := preload("res://characters/robot/robot_body.gdshader")
 const CUES := {
 	"idle": 4.0, "look": 2.2, "bounce": 1.3, "laugh": 1.8,
 	"wave": 2.0, "dance": 3.2, "sleep": 2.0, "roll": 1.6,
@@ -27,9 +28,13 @@ const STAGE_MIN := Vector2(-1.45, -0.70)
 const STAGE_MAX := Vector2(1.45, 0.90)
 const HOME := Vector2(0.0, 0.30)          # where it likes to chat
 const DOCK := Vector2(-1.05, -0.35)       # charging pad: rest and sleep
-const WALK_SPEED := 0.36
+const WALK_SPEED := 0.34
 const TURN_RATE := 2.0
-const STRIDE := 0.30
+# Leg length in stage units (hip height 0.194 x model scale 1.3) and the peak
+# thigh swing; one gait cycle (two steps) covers 4 * LEG * sin(swing), so the
+# feet plant instead of sliding.
+const LEG := 0.25
+const THIGH_SWING := 0.42
 # weight, cooldown seconds
 const BEHAVIORS := {
 	"idle_pause": [3.0, 0.0], "wander": [2.6, 4.0], "look_around": [1.6, 9.0],
@@ -61,6 +66,8 @@ var _walking := false
 var _speed := 0.0
 var _phase := 0.0
 var _step_amp := 0.0
+var _yaw_vel := 0.0
+var _lean := 0.0
 var _face_yaw_goal := 0.0
 var _spin_left := 0.0
 var _turn_hold := 0.0
@@ -91,6 +98,7 @@ var _beat_wait := 1.0
 var _last_cue := ""
 
 var _head := Vector2.ZERO
+var _head_vel := Vector2.ZERO
 var _saccade := Vector2.ZERO
 var _saccade_wait := 1.0
 var _own_blink := 0.0
@@ -465,45 +473,61 @@ func _walk_to(goal: Vector2) -> void:
 	_sit_goal = 0.0
 
 
+func _steer(goal_rate: float, delta: float) -> float:
+	# Angular velocity eases in and out, so turns start and settle like a body
+	# with weight instead of snapping to a fixed rate.
+	_yaw_vel = move_toward(_yaw_vel, goal_rate, delta * 7.0)
+	_yaw += _yaw_vel * delta
+	return clampf(absf(_yaw_vel) / TURN_RATE, 0.0, 1.0)
+
+
 func _update_locomotion(delta: float) -> void:
 	var turning := 0.0
 	var can_move := _sit < 0.15 and _gesture not in ["hop", "stretch"]
+	var previous_speed := _speed
 	if _walking and can_move:
 		var to := _target - _pos
 		var distance := to.length()
-		if distance < 0.05:
+		if distance < 0.04:
 			_walking = false
 		else:
 			var dyaw := wrapf(atan2(to.x, to.y) - _yaw, -PI, PI)
-			var turn := clampf(dyaw, -TURN_RATE * delta, TURN_RATE * delta)
-			_yaw += turn
-			turning = absf(turn) / maxf(delta * TURN_RATE, 0.0001)
-			var align := clampf(1.0 - absf(dyaw) / 1.1, 0.0, 1.0)
-			var goal_speed := WALK_SPEED * align * clampf(distance / 0.3, 0.35, 1.0)
-			_speed = move_toward(_speed, goal_speed, delta * 1.3)
-			_pos += Vector2(sin(_yaw), cos(_yaw)) * _speed * delta
-	else:
-		_speed = move_toward(_speed, 0.0, delta * 1.8)
+			turning = _steer(clampf(dyaw * 3.0, -TURN_RATE, TURN_RATE), delta)
+			var align := clampf(1.0 - absf(dyaw) / 1.2, 0.0, 1.0)
+			# Slow down smoothly on approach (no abrupt stop at the target).
+			var arrive := clampf(distance / 0.35, 0.0, 1.0)
+			var goal_speed := WALK_SPEED * align * lerpf(0.25, 1.0, arrive)
+			_speed = move_toward(_speed, goal_speed, delta * 0.9)
+	if not (_walking and can_move):
+		_speed = move_toward(_speed, 0.0, delta * 1.1)
 		if _spin_left != 0.0 and can_move:
-			var spin := clampf(_spin_left, -TURN_RATE * 0.9 * delta, TURN_RATE * 0.9 * delta)
-			_yaw += spin
-			_spin_left -= spin
-			if absf(_spin_left) < 0.001:
+			var before := _yaw
+			turning = _steer(clampf(_spin_left * 2.5, -TURN_RATE * 0.85, TURN_RATE * 0.85), delta)
+			_spin_left -= _yaw - before
+			if absf(_spin_left) < 0.01:
 				_spin_left = 0.0
-			turning = 1.0
 		elif can_move:
 			var dyaw2 := wrapf(_face_yaw_goal - _yaw, -PI, PI)
 			# A person doesn't shuffle for tiny corrections; turn only when it matters.
-			if absf(dyaw2) > 0.32 or (absf(dyaw2) > 0.06 and _turn_hold > 0.0):
+			if absf(dyaw2) > 0.32 or (absf(dyaw2) > 0.05 and _turn_hold > 0.0):
 				_turn_hold = 0.4
-				var turn2 := clampf(dyaw2, -TURN_RATE * 0.7 * delta, TURN_RATE * 0.7 * delta)
-				_yaw += turn2
-				turning = absf(turn2) / maxf(delta * TURN_RATE * 0.7, 0.0001)
 			_turn_hold = maxf(0.0, _turn_hold - delta)
+			var rate := clampf(dyaw2 * 2.5, -TURN_RATE * 0.7, TURN_RATE * 0.7) if _turn_hold > 0.0 else 0.0
+			turning = _steer(rate, delta)
+		else:
+			_steer(0.0, delta)
+	_pos += Vector2(sin(_yaw), cos(_yaw)) * _speed * delta
 	_pos = Vector2(clampf(_pos.x, STAGE_MIN.x, STAGE_MAX.x), clampf(_pos.y, STAGE_MIN.y, STAGE_MAX.y))
 	var gait := clampf(_speed / WALK_SPEED, 0.0, 1.0)
-	_step_amp = lerpf(_step_amp, maxf(gait, turning * 0.55), 1.0 - exp(-delta * 6.0))
-	_phase += delta * (TAU * _speed / STRIDE + turning * 7.0)
+	_step_amp = lerpf(_step_amp, maxf(gait, turning * 0.5), 1.0 - exp(-delta * 5.0))
+	# Phase follows distance covered: shorter, slower steps at low speed.
+	var stride := 4.0 * LEG * sin(THIGH_SWING * maxf(_step_amp, 0.35))
+	var phase_rate := TAU * _speed / maxf(stride, 0.05)
+	phase_rate = maxf(phase_rate, turning * 6.5)          # stepping in place while turning
+	_phase += delta * phase_rate
+	# Lean into acceleration and a little into speed.
+	var accel := (_speed - previous_speed) / maxf(delta, 0.0001)
+	_lean = lerpf(_lean, 0.10 * gait + clampf(accel * 0.12, -0.06, 0.08), 1.0 - exp(-delta * 4.0))
 	_sit = move_toward(_sit, _sit_goal, delta * 0.9)
 	if _model != null:
 		_model.position = Vector3(_pos.x, 0.0, _pos.y)
@@ -543,8 +567,13 @@ func _gesture_pose(q: Dictionary, root: Array) -> Dictionary:
 		"wave":
 			override["upperarm." + arm] = e
 			override["forearm." + arm] = e
-			_add(q, "upperarm." + arm, Quaternion(FORWARD, s * 1.40 * e) * Quaternion(RIGHT, -0.55 * e))
-			_add(q, "forearm." + arm, Quaternion(FORWARD, s * (1.15 + 0.38 * sin(t * TAU * 3.5)) * e))
+			# Arm up beside the big helmet; the hand sways from the elbow and
+			# the wrist follows a beat later, like a relaxed human wave.
+			var sway := sin(t * TAU * 3.2)
+			_add(q, "upperarm." + arm, Quaternion(FORWARD, s * (1.30 + 0.04 * sway) * e) * Quaternion(RIGHT, -0.75 * e))
+			_add(q, "forearm." + arm, Quaternion(FORWARD, s * (0.80 + 0.42 * sway) * e))
+			override["hand." + arm] = e
+			_add(q, "hand." + arm, Quaternion(FORWARD, s * 0.30 * sin(t * TAU * 3.2 - 0.9) * e))
 			_add(q, "head", Quaternion(FORWARD, -s * 0.10 * e))
 			_add(q, "spine", Quaternion(FORWARD, -s * 0.05 * e))
 		"think":
@@ -651,23 +680,30 @@ func _compose_pose(delta: float, state: Dictionary) -> void:
 	var gait_l := sin(ph)
 	var gait_r := sin(ph + PI)
 
-	# Torso: breathing, weight shift, walking counter-rotation.
-	root[0] += Vector3(0.0, 0.009 * a * absf(cos(ph)), 0.0)
-	_add(base, "hips", Quaternion(FORWARD, 0.05 * a * gait_l + 0.025 * (1.0 - a) * drift))
-	_add(base, "spine", Quaternion(UP, 0.08 * a * gait_l) * Quaternion(RIGHT, 0.012 * breath + 0.03 * a) \
-		* Quaternion(FORWARD, -0.015 * (1.0 - a) * drift))
+	# Torso: breathing, weight shift, walking counter-rotation. The body dips
+	# at each foot contact and rises over the stance leg (two bobs per cycle),
+	# sways toward the supporting foot and leans into its speed.
+	root[0] += Vector3(0.012 * a * sin(ph), 0.010 * a * (0.5 - 0.5 * cos(2.0 * ph)) - 0.008 * a, 0.0)
+	root[0] += Vector3(0.006 * (1.0 - a) * drift, 0.0, 0.0)       # idle weight shift
+	_add(base, "hips", Quaternion(FORWARD, 0.045 * a * gait_l + 0.025 * (1.0 - a) * drift) * Quaternion(UP, -0.06 * a * gait_l))
+	_add(base, "spine", Quaternion(UP, 0.09 * a * gait_l) * Quaternion(RIGHT, 0.012 * breath + _lean) \
+		* Quaternion(FORWARD, -0.035 * a * gait_l - 0.015 * (1.0 - a) * drift))
 	for side_name in ["L", "R"]:
 		var k := -1.0 if side_name == "L" else 1.0
 		var g := gait_l if side_name == "L" else gait_r
-		var swing := maxf(0.0, cos(ph if side_name == "L" else ph + PI))
-		var thigh := -0.40 * a * g
-		var knee := 0.65 * a * swing
+		var c := cos(ph if side_name == "L" else ph + PI)
+		# Knee lifts smoothly in swing (leg travelling forward), soft in stance.
+		var swing := pow(maxf(0.0, c), 1.6)
+		var thigh := -THIGH_SWING * a * g - 0.10 * a * swing
+		var knee := 0.08 * a + 0.70 * a * swing
 		_add(base, "thigh." + side_name, Quaternion(RIGHT, thigh))
 		_add(base, "shin." + side_name, Quaternion(RIGHT, knee))
-		_add(base, "foot." + side_name, Quaternion(RIGHT, -0.35 * (thigh + knee)))
+		# Foot stays level on the ground; toes push off as the leg trails.
+		var toe_off := 0.25 * a * smoothstep(0.3, 1.0, -g) * (1.0 - swing)
+		_add(base, "foot." + side_name, Quaternion(RIGHT, -(thigh + knee) + toe_off))
 		# Arms hang relaxed and swing against the legs while walking.
-		_add(base, "upperarm." + side_name, Quaternion(FORWARD, k * (0.07 + 0.012 * breath)) * Quaternion(RIGHT, 0.30 * a * g))
-		_add(base, "forearm." + side_name, Quaternion(RIGHT, -0.12 - 0.18 * a))
+		_add(base, "upperarm." + side_name, Quaternion(FORWARD, k * (0.07 + 0.012 * breath + 0.03 * a)) * Quaternion(RIGHT, 0.32 * a * g))
+		_add(base, "forearm." + side_name, Quaternion(RIGHT, -0.12 - 0.16 * a - 0.10 * a * maxf(0.0, -g)))
 
 	# Sitting (rest / sleep): fold the legs forward and lower the body.
 	if _sit > 0.001:
@@ -700,7 +736,12 @@ func _compose_pose(delta: float, state: Dictionary) -> void:
 	if _asleep:
 		want_yaw = 0.0
 		want_pitch = -0.30
-	_head = _head.lerp(Vector2(want_yaw, want_pitch), 1.0 - exp(-delta * (6.0 if state["engaged"] else 3.0)))
+	# Critically damped spring: the head eases out of rest and into the new
+	# target (no velocity jump when attention switches).
+	var w := 7.0 if state["engaged"] else 4.5
+	var dt := minf(delta, 0.05)
+	_head_vel += ((Vector2(want_yaw, want_pitch) - _head) * w * w - _head_vel * 2.0 * w) * dt
+	_head += _head_vel * dt
 	# Turn the whole body when the head would have to twist too far for long.
 	if absf(want_yaw) > 0.85 and not _walking and _gesture == "" and _sit < 0.2:
 		_face_yaw_goal = _yaw + want_yaw
@@ -846,19 +887,8 @@ func _apply_materials() -> void:
 		if mesh_instance.mesh == null or mesh_instance.material_override != null:
 			continue
 		mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		# Two-tone plastic from the baked whiteness field (no texture atlas).
+		var material := ShaderMaterial.new()
+		material.shader = BODY_SHADER
 		for surface in mesh_instance.mesh.get_surface_count():
-			var source := mesh_instance.mesh.surface_get_material(surface) as StandardMaterial3D
-			if source == null:
-				continue
-			# Satin toy plastic: keep color and normal maps; the source's
-			# roughness map is near zero and reads as chrome, so replace it.
-			var material := source.duplicate() as StandardMaterial3D
-			material.metallic = 0.0
-			material.metallic_texture = null
-			material.roughness_texture = null
-			material.roughness = 0.42
-			material.metallic_specular = 0.38
-			material.clearcoat_enabled = true
-			material.clearcoat = 0.18
-			material.clearcoat_roughness = 0.35
 			mesh_instance.set_surface_override_material(surface, material)
