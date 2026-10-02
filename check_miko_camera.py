@@ -65,6 +65,7 @@ def main() -> int:
     engine = miko_vision.VisionEngine()
     print("\nLook at the camera, then wave hello beside your face. Press Q to finish.\n")
     seen_once = waved = False
+    frames = 0
     started = time.monotonic()
     try:
         while time.monotonic() - started < 120:
@@ -86,7 +87,10 @@ def main() -> int:
             cv2.putText(view, "Miko camera check - Q to finish", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.imshow("Miko camera check", cv2.flip(view, 1))
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q"), 27) or cv2.getWindowProperty("Miko camera check", cv2.WND_PROP_VISIBLE) < 1:
+            frames += 1
+            # Closing the preview window also finishes (checked once it is up).
+            closed = frames > 15 and cv2.getWindowProperty("Miko camera check", cv2.WND_PROP_VISIBLE) < 1
+            if key in (ord("q"), ord("Q"), 27) or closed:
                 break
     finally:
         capture.release()
@@ -97,7 +101,38 @@ def main() -> int:
     return 0
 
 
+class _Tee:
+    """Mirror everything printed into check_miko_camera_log.txt (easy to send)."""
+
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+
+    def write(self, text):
+        self.stream.write(text)
+        self.log.write(text)
+        self.log.flush()
+
+    def flush(self):
+        self.stream.flush()
+
+
 if __name__ == "__main__":
-    code = main()
-    input("\nPress Enter to close...")
+    import traceback
+    code = 1
+    try:
+        log = open(os.path.join(HERE, "check_miko_camera_log.txt"), "w", encoding="utf-8")
+        sys.stdout = _Tee(sys.stdout, log)
+        sys.stderr = _Tee(sys.stderr, log)
+    except OSError:
+        pass
+    try:
+        code = main()
+    except BaseException:
+        print("\nXX  The camera check stopped with an error:")
+        traceback.print_exc()
+    print("\nA copy of this text is saved in check_miko_camera_log.txt")
+    try:
+        input("\nPress Enter to close...")
+    except EOFError:
+        pass
     raise SystemExit(code)
