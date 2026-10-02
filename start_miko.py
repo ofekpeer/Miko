@@ -181,9 +181,30 @@ def ensure_imported(exe, project):
     return True
 
 
+def installed_brain_version():
+    import re
+    try:
+        text = (root / 'miko_brain.py').read_text(encoding='utf-8')
+    except OSError:
+        return ''
+    match = re.search(r'^BRAIN_VERSION\s*=\s*"([^"]+)"', text, re.M)
+    return match.group(1) if match else ''
+
+
 def launch():
     print('Miko 17 — Device-ready companion', flush=True)
     current = health()
+    expected = installed_brain_version()
+    if current and is_miko_17(current) and expected and current.get('version') != expected:
+        # An update was installed while an older Brain kept running.
+        print('Restarting Miko\'s Brain to load the update (', current.get('version'), '->', expected, ')', flush=True)
+        stopper = Path(__file__).resolve().parent / 'stop_miko.py'
+        subprocess.run([sys.executable, '-X', 'utf8', str(stopper)], cwd=stopper.parent)
+        for _ in range(40):
+            time.sleep(.25)
+            if not health():
+                break
+        current = health()
     if current and not is_miko_17(current):
         print('Port 5000 belongs to a different or older service. Stop it and start Miko again.')
         input('Press Enter to close...')
