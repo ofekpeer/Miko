@@ -122,6 +122,11 @@ config['runtime_dir']=str(target)
 for name,digest in digests.items():
     if hashlib.sha256((target/name).read_bytes()).hexdigest()!=digest:raise RuntimeError('Persistent data changed: '+name)
 (backup/'INSTALL_VERIFICATION.json').write_text(json.dumps({'data_preserved':True,'files':digests,'version':'17.4'},indent=2),encoding='utf-8')
+# Import the new 3D assets now so the first start shows Miko, not a grey window.
+exe=launcher.godot_executable()
+if exe and hasattr(launcher,'ensure_imported'):
+    print('Preparing the 3D files...')
+    launcher.ensure_imported(exe,target/'miko-3d')
 # Sight is optional: OpenCV lets Miko see the owner. A failure here never
 # blocks the update; Miko then simply runs without the camera.
 try:

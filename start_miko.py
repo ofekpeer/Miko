@@ -140,6 +140,47 @@ def godot_executable():
     return None
 
 
+def _project_stamp(project):
+    import hashlib
+    digest = hashlib.sha256()
+    for path in sorted(project.rglob('*')):
+        relative = path.relative_to(project)
+        if not path.is_file() or relative.parts[0] in ('.godot', '.git') or path.suffix == '.log':
+            continue
+        info = path.stat()
+        digest.update(f'{relative.as_posix()}|{info.st_size}|{info.st_mtime_ns}\n'.encode('utf-8'))
+    return digest.hexdigest()
+
+
+def ensure_imported(exe, project):
+    """Import new/changed 3D assets before the game opens.
+
+    A release (ZIP or installer) ships source assets but not Godot's
+    .godot/imported cache; without it the game window stays grey. Runs only
+    when project files changed since the last successful import."""
+    stamp_file = project / '.godot' / 'miko_import_stamp.txt'
+    stamp = _project_stamp(project)
+    try:
+        if stamp_file.read_text(encoding='utf-8').strip() == stamp:
+            return True
+    except OSError:
+        pass
+    print('Preparing Miko\'s 3D files (first start after an update can take a minute)...', flush=True)
+    try:
+        result = subprocess.run([exe, '--headless', '--path', str(project), '--import'], cwd=project,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=900, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print('Godot import did not finish:', type(error).__name__)
+        return False
+    if not (project / '.godot' / 'imported').is_dir():
+        print('Godot import failed (exit code', result.returncode, ').')
+        return False
+    stamp_file.parent.mkdir(exist_ok=True)
+    stamp_file.write_text(_project_stamp(project), encoding='utf-8')
+    return True
+
+
 def launch():
     print('Miko 17 — Device-ready companion', flush=True)
     current = health()
@@ -173,6 +214,7 @@ def launch():
     if exe and (project/'project.godot').is_file():
         game_pid = running_game_pid(project)
         if game_pid is None:
+            ensure_imported(exe, project)
             log_dir=root/'miko_logs'
             log_dir.mkdir(exist_ok=True)
             game_log=log_dir/('godot_'+time.strftime('%Y%m%d_%H%M%S')+'.log')
