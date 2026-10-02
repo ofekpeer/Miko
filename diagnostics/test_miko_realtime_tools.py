@@ -297,6 +297,27 @@ class RealtimeToolsRegression(fixture.MikoFixture):
         cue = self.tools.call("miko_set_expression", {"emotion": "happy", "action": "bounce"})
         self.assertEqual(cue, {"ok": True, "status": "expression_set", "emotion": "happy", "action": "bounce"})
 
+    def test_body_actions_are_validated_and_bounded(self):
+        names = {item["name"] for item in self.tools.tool_definitions()}
+        self.assertIn("miko_perform_action", names)
+        self.assertIn("miko_get_vision", names)
+        jump = self.tools.call("miko_perform_action", {"action": "jump", "times": 3})
+        self.assertEqual(jump, {"ok": True, "status": "performing", "action": "jump", "times": 3})
+        self.assertEqual(self.tools.call("miko_perform_action", {"action": "wave", "times": 99})["times"], 5)
+        self.assertEqual(self.tools.call("miko_perform_action", {"action": "walk_left"})["times"], 1)
+        self.assertEqual(self.tools.call("miko_perform_action", {"action": "fly"})["status"], "invalid_action")
+
+    def test_vision_reports_camera_off_without_provider_and_summary_with_one(self):
+        MikoRealtimeTools.vision_provider = None
+        self.assertEqual(self.tools.call("miko_get_vision", {})["status"], "camera_off")
+        try:
+            MikoRealtimeTools.vision_provider = lambda: {"status": "watching", "seen": True, "where": "left"}
+            seen = self.tools.call("miko_get_vision", {})
+            self.assertTrue(seen["ok"] and seen["seen"])
+            self.assertEqual(seen["where"], "left")
+        finally:
+            MikoRealtimeTools.vision_provider = None
+
 
 if __name__ == "__main__":
     for stream in (sys.stdout, sys.stderr):

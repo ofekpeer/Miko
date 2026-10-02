@@ -31,6 +31,19 @@ MAX_OUTBOUND_QUEUE_MESSAGES = 64
 UPLINK_PCM = 0x01
 DOWNLINK_PCM = 0x02
 CAMERA_JPEG = 0x03
+# Continuous low-resolution frames for local perception (presence, waves).
+# Only while the server sent vision_stream active=true; processed in memory
+# on the server, never stored or forwarded to a model.
+VISION_JPEG = 0x04
+MAX_VISION_JPEG_BYTES = 24_000
+VISION_MAX_FPS = 6
+VISION_STREAM = {"fps": 4, "width": 240, "height": 180, "max_bytes": MAX_VISION_JPEG_BYTES}
+# Device motion (IMU) for physical interaction: being shaken, moved, turned
+# over. Batches of samples; accel in milli-g, gyro in deci-degrees/second.
+MOTION_IMU = 0x05
+MAX_IMU_SAMPLES = 32
+IMU_SAMPLE = struct.Struct(">Hhhhhhh")      # offset_ms, ax, ay, az (mg), gx, gy, gz (0.1 deg/s)
+MAX_IMU_SAMPLES_PER_SECOND = 200
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 HEX_16_RE = re.compile(r"^[0-9a-f]{32}$")
 HEX_32_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -141,3 +154,52 @@ def validate_jpeg(jpeg: bytes) -> None:
         raise ProtocolError("JPEG size outside device limit")
     if not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
         raise ProtocolError("invalid JPEG boundary markers")
+
+
+def encode_vision_jpeg(sequence: int, jpeg: bytes) -> bytes:
+    if not 0 <= sequence <= 0xFFFFFFFF or len(jpeg) > MAX_VISION_JPEG_BYTES:
+        raise ProtocolError("invalid vision frame")
+    validate_jpeg(jpeg)
+    return bytes([VISION_JPEG]) + struct.pack(">I", sequence) + jpeg
+
+
+def decode_vision_jpeg(frame: bytes) -> tuple[int, bytes]:
+    if len(frame) < 9 or frame[0] != VISION_JPEG:
+        raise ProtocolError("invalid vision frame")
+    jpeg = frame[5:]
+    if len(jpeg) > MAX_VISION_JPEG_BYTES:
+        raise ProtocolError("vision frame too large")
+    validate_jpeg(jpeg)
+    return struct.unpack_from(">I", frame, 1)[0], jpeg
+
+
+def encode_motion_imu(sequence: int, device_ms: int, samples) -> bytes:
+    """samples: (offset_ms, ax_mg, ay_mg, az_mg, gx_ddps, gy_ddps, gz_ddps) ints."""
+    samples = list(samples)
+    if not 0 <= sequence <= 0xFFFFFFFF or not 0 <= device_ms <= 0xFFFFFFFF or not 1 <= len(samples) <= MAX_IMU_SAMPLES:
+        raise ProtocolError("invalid motion batch")
+    try:
+        body = b"".join(IMU_SAMPLE.pack(*(int(v) for v in sample)) for sample in samples)
+    except (struct.error, TypeError, ValueError) as error:
+        raise ProtocolError("invalid motion sample") from error
+    return bytes([MOTION_IMU]) + struct.pack(">IIB", sequence, device_ms, len(samples)) + body
+
+
+def decode_motion_imu(frame: bytes) -> tuple[int, list[tuple[float, float, float, float, float, float, float]]]:
+    """Returns (sequence, [(t_seconds, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)])
+    with t on the device clock."""
+    if len(frame) < 10 or frame[0] != MOTION_IMU:
+        raise ProtocolError("invalid motion frame")
+    sequence, device_ms, count = struct.unpack_from(">IIB", frame, 1)
+    if not 1 <= count <= MAX_IMU_SAMPLES or len(frame) != 10 + count * IMU_SAMPLE.size:
+        raise ProtocolError("invalid motion batch size")
+    samples = []
+    previous = -1
+    for index in range(count):
+        offset, ax, ay, az, gx, gy, gz = IMU_SAMPLE.unpack_from(frame, 10 + index * IMU_SAMPLE.size)
+        if offset < previous:
+            raise ProtocolError("motion samples out of order")
+        previous = offset
+        samples.append(((device_ms + offset) / 1000.0, ax / 1000.0, ay / 1000.0, az / 1000.0,
+                        gx / 10.0, gy / 10.0, gz / 10.0))
+    return sequence, samples

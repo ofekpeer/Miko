@@ -38,6 +38,11 @@ from .protocol import (
     HEX_16_RE,
     ProtocolError,
     decode_camera_jpeg,
+    decode_motion_imu,
+    decode_vision_jpeg,
+    MAX_IMU_SAMPLES_PER_SECOND,
+    VISION_MAX_FPS,
+    VISION_STREAM,
     decode_pairing_secret,
     decode_uplink_pcm,
     encode_downlink_pcm,
@@ -114,7 +119,7 @@ class BridgeSettings:
             if not isinstance(raw_caps, list) or not all(isinstance(x, str) for x in raw_caps):
                 raise DeviceConfigError("invalid device capabilities")
             capabilities = frozenset(raw_caps)
-            if not capabilities or not capabilities <= {"audio", "display", "gesture", "camera"}:
+            if not capabilities or not capabilities <= {"audio", "display", "gesture", "camera", "vision", "motion"}:
                 raise DeviceConfigError("unsupported device capability")
             devices[device_id] = PairedDevice(device_id, secret, capabilities)
         if enabled and (not devices or not cert_path or not key_path or not cert_path.is_file() or not key_path.is_file()):
@@ -372,6 +377,7 @@ class DeviceBridge:
                 }))
                 transport.start()
                 await native.send({"type": "status", "status": "idle", "detail": "Device connected"})
+                await self._sync_vision(connection)
             async for payload in ws:
                 if isinstance(payload, bytes):
                     await self._binary(connection, payload)
@@ -430,6 +436,10 @@ class DeviceBridge:
             if not connection.native.api:
                 return
             await connection.native.client_event({"type": "audio", "audio": base64.b64encode(pcm).decode("ascii")})
+        elif frame[0] == 0x04:
+            await self._vision_frame(connection, frame)
+        elif frame[0] == 0x05:
+            await self._motion_frame(connection, frame)
         elif frame[0] == 0x03:
             request_id, jpeg = decode_camera_jpeg(frame)
             future = connection.pending_snapshots.pop(request_id, None)
@@ -438,6 +448,64 @@ class DeviceBridge:
             future.set_result(jpeg)
         else:
             raise ProtocolError("unknown binary frame")
+
+    def _vision_wanted(self, connection: "_DeviceConnection") -> bool:
+        vision = getattr(self.hub, "vision", None)
+        return "vision" in connection.capabilities and vision is not None and bool(vision.enabled)
+
+    async def _sync_vision(self, connection: "_DeviceConnection") -> None:
+        """Tell the device whether to stream perception frames (owner toggle)."""
+        active = self._vision_wanted(connection)
+        if "vision" not in connection.capabilities or active == connection.vision_active:
+            return
+        connection.vision_active = active
+        message = {"type": "vision_stream", "active": active}
+        if active:
+            message.update(VISION_STREAM)
+        await connection.transport.send(json.dumps(message))
+
+    async def set_vision_stream(self) -> None:
+        for connection in list(self.active.values()):
+            if not connection.transport.closed:
+                await self._sync_vision(connection)
+
+    async def _vision_frame(self, connection: "_DeviceConnection", frame: bytes) -> None:
+        if not connection.vision_active or "vision" not in connection.capabilities:
+            raise ProtocolError("unsolicited vision frame")
+        _, jpeg = decode_vision_jpeg(frame)
+        now = time.monotonic()
+        # Bounded: drop (not disconnect) frames above the agreed rate or while
+        # the previous frame is still being analysed.
+        if now - connection.last_vision_at < 1.0 / VISION_MAX_FPS or connection.vision_busy:
+            return
+        connection.last_vision_at = now
+        vision = getattr(self.hub, "vision", None)
+        if vision is None:
+            return
+        connection.vision_busy = True
+        try:
+            await asyncio.to_thread(vision.feed_jpeg, jpeg)
+        finally:
+            connection.vision_busy = False
+
+    async def _motion_frame(self, connection: "_DeviceConnection", frame: bytes) -> None:
+        """IMU samples: the device feels itself being shaken, moved or turned
+        over (not a camera; works with sight switched off)."""
+        if "motion" not in connection.capabilities:
+            raise ProtocolError("unsolicited motion frame")
+        _, samples = decode_motion_imu(frame)
+        now = time.monotonic()
+        # Bounded: a window of one second at most MAX_IMU_SAMPLES_PER_SECOND
+        # samples; excess batches are dropped, not queued.
+        if now - connection.motion_window_at >= 1.0:
+            connection.motion_window_at, connection.motion_samples = now, 0
+        connection.motion_samples += len(samples)
+        if connection.motion_samples > MAX_IMU_SAMPLES_PER_SECOND:
+            return
+        vision = getattr(self.hub, "vision", None)
+        if vision is None or not hasattr(vision, "feed_imu"):
+            return
+        await asyncio.to_thread(vision.feed_imu, samples)
 
     async def request_snapshot(self, device_id: str, *, requested_by_user: bool) -> bytes:
         """Request one in-memory JPEG only for an explicit user request.
@@ -477,6 +545,12 @@ class DeviceBridge:
                 "emotion": str(event.get("emotion", "neutral"))[:32],
                 "action": str(event.get("action", "idle"))[:32],
             }
+        elif kind == "action" and "gesture" in connection.capabilities:
+            try:
+                times = max(1, min(5, int(event.get("times", 1))))
+            except (TypeError, ValueError):
+                times = 1
+            cue = {"type": "gesture", "emotion": "", "action": str(event.get("action", "idle"))[:32], "times": times}
         elif kind == "status" and "display" in connection.capabilities:
             cue = {
                 "type": "status",
@@ -504,6 +578,11 @@ class _DeviceConnection:
     expected_sequence: int = 0
     rate_limit: _RateLimit | None = None
     pending_snapshots: dict[str, asyncio.Future[bytes]] | None = None
+    vision_active: bool = False
+    vision_busy: bool = False
+    last_vision_at: float = 0.0
+    motion_window_at: float = 0.0
+    motion_samples: int = 0
     finalized: asyncio.Event = field(default_factory=asyncio.Event)
 
     def __post_init__(self) -> None:

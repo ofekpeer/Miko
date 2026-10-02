@@ -1,4 +1,6 @@
 extends Node3D
+const MikoLog = preload("res://miko_log.gd")
+const BehaviorArbiter = preload("res://characters/robot/behavior_arbiter.gd")
 ## Miko robot: a free-roaming companion with a live visor face.
 ##
 ## main.tscn instances this scene as "MikoScene" (Model = RobotMiko.glb). The
@@ -15,6 +17,7 @@ extends Node3D
 ## * Brain cues (wave, laugh, dance, bounce, roll, sleep, look) map to gestures.
 
 const FACE_SHADER := preload("res://characters/robot/robot_face.gdshader")
+const BODY_SHADER := preload("res://characters/robot/robot_body.gdshader")
 const CUES := {
 	"idle": 4.0, "look": 2.2, "bounce": 1.3, "laugh": 1.8,
 	"wave": 2.0, "dance": 3.2, "sleep": 2.0, "roll": 1.6,
@@ -27,9 +30,13 @@ const STAGE_MIN := Vector2(-1.45, -0.70)
 const STAGE_MAX := Vector2(1.45, 0.90)
 const HOME := Vector2(0.0, 0.30)          # where it likes to chat
 const DOCK := Vector2(-1.05, -0.35)       # charging pad: rest and sleep
-const WALK_SPEED := 0.36
+const WALK_SPEED := 0.34
 const TURN_RATE := 2.0
-const STRIDE := 0.30
+# Leg length in stage units (hip height 0.194 x model scale 1.3) and the peak
+# thigh swing; one gait cycle (two steps) covers 4 * LEG * sin(swing), so the
+# feet plant instead of sliding.
+const LEG := 0.25
+const THIGH_SWING := 0.42
 # weight, cooldown seconds
 const BEHAVIORS := {
 	"idle_pause": [3.0, 0.0], "wander": [2.6, 4.0], "look_around": [1.6, 9.0],
@@ -37,6 +44,14 @@ const BEHAVIORS := {
 	"little_dance": [0.3, 120.0], "turn_around": [0.4, 60.0], "wave_user": [0.22, 200.0],
 	"sit_rest": [0.45, 80.0], "hum_bob": [0.6, 30.0],
 }
+
+## Frame heartbeat and current update step, read by the controller watchdog.
+var frame_serial := 0
+var stage := "init"
+## Decides how big a reaction to a perception event is (see behavior_arbiter.gd).
+var arbiter = BehaviorArbiter.new()
+var _state_now: Dictionary = {}
+var debug_halt := false
 
 ## State overrides for previews/tests (same keys as _read_state()).
 var manual_state: Dictionary = {}
@@ -61,6 +76,8 @@ var _walking := false
 var _speed := 0.0
 var _phase := 0.0
 var _step_amp := 0.0
+var _yaw_vel := 0.0
+var _lean := 0.0
 var _face_yaw_goal := 0.0
 var _spin_left := 0.0
 var _turn_hold := 0.0
@@ -82,6 +99,38 @@ var _asleep := false
 var _sleep_walk := false
 var _sleep_left := 0.0
 
+# Owner commands ("תלך שמאלה", "תקפוץ", "שב") take priority over autonomy.
+var _command := ""
+var _command_left := 0.0
+var _gesture_queue: Array = []
+var _sit_hold := false
+var _sit_hold_left := 0.0
+var _backward := false
+
+# What the camera reports about the owner (host-side perception).
+var _vision_seen := false
+var _vision_fresh_until := -1.0
+var _vision_point := Vector3.ZERO      # owner's head, MikoScene local space
+var _vision_last_seen := -1e9
+var _surprise_left := 0.0
+var _blind := false                    # camera covered: Miko "can't see"
+var _dizzy_left := 0.0
+var _joy_left := 0.0
+var _plop_left := 0.0
+var _last_variant: Dictionary = {}
+## Reactions start after a short, human reaction time. Tests switch it off.
+var reaction_delay_enabled := true
+var _reaction_queue: Array = []        # [fire_at, event]
+var _owner_expression := "neutral"
+var _owner_looking := true
+var _owner_roll := 0.0
+var _mirror_roll := 0.0
+var _wink_left := 0.0
+var _concern_left := 0.0
+var _sleepy_left := 0.0
+var _gaze_follow := Vector2.ZERO
+var _gaze_follow_left := 0.0
+
 var _gesture := ""
 var _gesture_t := 0.0
 var _gesture_len := 1.0
@@ -91,6 +140,7 @@ var _beat_wait := 1.0
 var _last_cue := ""
 
 var _head := Vector2.ZERO
+var _head_vel := Vector2.ZERO
 var _saccade := Vector2.ZERO
 var _saccade_wait := 1.0
 var _own_blink := 0.0
@@ -201,18 +251,75 @@ func _process(delta: float) -> void:
 	if not _materials_ready:
 		_apply_materials()
 		_materials_ready = true
+	# A long hitch (window dragged, GPU stall) must not fling the body.
+	delta = minf(delta, 0.1)
 	_clock += delta
+	# `stage` names the step in progress: if a step ever fails, the frame
+	# heartbeat stops and the controller's watchdog logs where and recovers.
+	stage = "read_state"
 	var state := _read_state()
+	_state_now = state
+	stage = "engagement"
 	_update_engagement(delta, state)
+	stage = "cues"
 	_update_cues(state)
+	stage = "command"
+	_update_command(delta)
+	stage = "reactions"
+	_update_reactions(delta)
+	stage = "behavior"
 	_update_behavior(delta, state)
+	stage = "locomotion"
 	_update_locomotion(delta)
+	if not (is_finite(_pos.x) and is_finite(_pos.y) and is_finite(_yaw) and is_finite(_speed) and is_finite(_lean)):
+		# A non-finite value would make the body vanish or freeze without any
+		# script error, so the heartbeat could not see it: reset explicitly.
+		recover("non-finite body state")
+		_pos = HOME
+		_yaw = 0.0
+		_lean = 0.0
+	stage = "gesture_clock"
 	if _gesture != "":
-		_gesture_t += delta / _gesture_len
+		_gesture_t += delta / maxf(_gesture_len, 0.1)
 		if _gesture_t >= 1.0:
 			_gesture = ""
+			arbiter.gesture_finished()
+	stage = "pose"
+	if debug_halt:
+		return                          # test hook: simulates a step that fails every frame
 	_compose_pose(delta, state)
+	stage = "face"
 	_update_face(delta, state)
+	stage = "done"
+	frame_serial += 1
+
+
+## Deterministic way out of any stuck behaviour: drop every transient
+## action/reaction state and return to a calm idle. Memory-free and safe to
+## call at any time (the controller's watchdog calls it if frames stall).
+func recover(reason: String) -> void:
+	MikoLog.info("RECOVERY", "robot reset to idle", {"reason": reason, "stage": stage})
+	_gesture = ""
+	_gesture_t = 0.0
+	_gesture_queue.clear()
+	_reaction_queue.clear()
+	_command = ""
+	_command_left = 0.0
+	_walking = false
+	_backward = false
+	_spin_left = 0.0
+	_speed = 0.0
+	_yaw_vel = 0.0
+	_blind = false
+	_dizzy_left = 0.0
+	_plop_left = 0.0
+	_surprise_left = 0.0
+	_sleep_walk = false
+	if not _sit_hold:
+		_sit_goal = 0.0
+	_behavior = "idle_pause"
+	_behavior_left = 2.0
+	stage = "recovered"
 
 
 # ------------------------------------------------------------------ attention / conversation
@@ -238,22 +345,431 @@ func _on_conversation_start() -> void:
 	var away := _clock - _last_engaged
 	_asleep = false
 	_sleep_walk = false
-	_sit_goal = 0.0
+	if not _sit_hold:
+		_sit_goal = 0.0
 	_behavior = "converse"
 	# Come over if it wandered off; otherwise just turn around to face you.
-	if _pos.distance_to(HOME) > 0.7:
+	if _command != "":
+		pass
+	elif _pos.distance_to(HOME) > 0.7 and not _sit_hold:
 		_walk_to(HOME + Vector2(_rng.randf_range(-0.35, 0.35), _rng.randf_range(-0.1, 0.15)))
 	else:
 		_walking = false
-	if away > 90.0:
+	if away > 90.0 and arbiter.family_ready("greeting", _clock):
+		arbiter.note_autonomous("greeting", _clock, 20.0)
 		_queue_gesture("wave", 2.3, 0.0, true)
 
 
+func _wake_for_reaction() -> void:
+	if _asleep or _sleep_walk:
+		_asleep = false
+		_sleep_walk = false
+		if not _sit_hold:
+			_sit_goal = 0.0
+
+
 func _camera_local() -> Vector3:
+	# Where the owner actually is when the camera sees them; else the screen.
+	if _vision_seen and _clock < _vision_fresh_until:
+		return _vision_point
 	var camera := get_viewport().get_camera_3d()
 	if camera == null:
 		return Vector3(0.0, 1.0, 5.0)
 	return to_local(camera.global_position)
+
+
+## Host perception events (miko_vision.py via the voice relay):
+## {"type":"vision","seen":bool,"x","y","size"} with x/y from the viewer's side,
+## or {"type":"vision_event","event":"wave"|"arrived"|"left"|"approached"}.
+func on_vision(event: Dictionary) -> void:
+	if str(event.get("type", "")) == "vision":
+		_vision_seen = bool(event.get("seen", false))
+		_vision_fresh_until = _clock + 1.5
+		if _vision_seen:
+			_vision_last_seen = _clock
+			var camera := get_viewport().get_camera_3d()
+			if camera != null:
+				var basis := camera.global_transform.basis
+				# The owner sits behind the screen; closer faces look bigger.
+				var distance := clampf(0.55 / maxf(float(event.get("size", 0.2)), 0.05), 1.2, 4.0)
+				var head := camera.global_position \
+					+ basis.x * (float(event.get("x", 0.0)) * 0.45 * distance) \
+					+ basis.y * (float(event.get("y", 0.0)) * 0.32 * distance - 0.1) \
+					+ basis.z * (distance - 1.0)
+				_vision_point = to_local(head)
+			_owner_expression = str(event.get("expression", _owner_expression))
+			_owner_looking = bool(event.get("looking", _owner_looking))
+			_owner_roll = float(event.get("roll", 0.0))
+		return
+	if not reaction_delay_enabled:
+		_react(event)
+		return
+	# People need a moment to notice and respond; startling things are faster.
+	var kind := str(event.get("event", ""))
+	var delay := _rng.randf_range(0.08, 0.22) if kind in ["covered", "shaken", "shake_started", "surprised", "uncovered", "orientation_changed"] \
+		else _rng.randf_range(0.18, 0.6)
+	_reaction_queue.append([_clock + delay, event])
+
+
+func _update_reactions(delta: float) -> void:
+	_wink_left = maxf(0.0, _wink_left - delta)
+	_concern_left = maxf(0.0, _concern_left - delta)
+	_sleepy_left = maxf(0.0, _sleepy_left - delta)
+	_gaze_follow_left = maxf(0.0, _gaze_follow_left - delta)
+	var due: Array = []
+	for item in _reaction_queue:
+		if item[0] <= _clock:
+			due.append(item)
+	for item in due:
+		_reaction_queue.erase(item)
+		_react(item[1])
+
+
+func _react(event: Dictionary) -> void:
+	var kind := str(event.get("event", ""))
+	var busy := _command != "" and _command not in ["sit", "look_around"]
+	var decision: Dictionary = arbiter.decide(kind, event, {
+		"now": _clock, "user_speaking": bool(_state_now.get("listening", false)),
+		"miko_speaking": bool(_state_now.get("speaking", false)) or bool(_state_now.get("thinking", false)),
+		"gesture_active": _gesture != "", "busy_command": busy})
+	var level: int = int(decision.get("level", 0))
+	# World state changes apply at every level; only the visible reaction is
+	# scaled (an "uncovered" that only gets a glance must still end blindness).
+	if kind == "covered":
+		_blind = true
+	elif kind == "uncovered":
+		_blind = false
+	if level <= 0:
+		return
+	if level == 1:
+		_micro_react(kind, event)
+		return
+	# FACIAL: the face reacts, the body keeps doing what it was doing.
+	var body_before := [_gesture, _gesture_t, _gesture_len, _gesture_side, _gesture_amp, _gesture_queue.duplicate()]
+	_react_full(kind, event, busy)
+	if level == 2:
+		_gesture = body_before[0]
+		_gesture_t = body_before[1]
+		_gesture_len = body_before[2]
+		_gesture_side = body_before[3]
+		_gesture_amp = body_before[4]
+		_gesture_queue = body_before[5]
+
+
+## The smallest visible acknowledgement: eyes and attention only, no gesture.
+func _micro_react(kind: String, event: Dictionary) -> void:
+	match kind:
+		# Faces mirror faces, quickly and subtly, even when the body stays put.
+		"smiled", "laughing":
+			_joy_left = maxf(_joy_left, 1.5)
+		"frowned":
+			_concern_left = maxf(_concern_left, 3.0)
+		"winked":
+			_wink_left = 0.45
+		"surprised":
+			_surprise_left = maxf(_surprise_left, 0.8)
+		"yawned", "eyes_closed":
+			_sleepy_left = maxf(_sleepy_left, 2.0)
+		"shake_active":
+			_dizzy_left = maxf(_dizzy_left, 1.2)        # still being shaken: keep wobbling
+		"device_moved", "device_nudged":
+			_surprise_left = maxf(_surprise_left, 0.35)
+		"motion", "scene_changed", "light_changed":
+			if not _asleep:
+				var side := clampf(float(event.get("x", 0.0)), -1.0, 1.0)
+				_look_point = _camera_local() + Vector3(side * 1.6, -0.3, 0.0)
+				_look_user = false
+				_look_wait = 1.6
+		"looked_away", "left", "someone_left", "looked_somewhere", "tilted_head":
+			if not _asleep:
+				_look_wait = minf(_look_wait, 0.4)
+		_:
+			if not _asleep:
+				_look_user = true
+				_look_wait = 1.5
+
+
+func _react_full(kind: String, event: Dictionary, busy: bool) -> void:
+	match kind:
+		"wave":
+			# Wave back the way a person would, a little differently each time.
+			if busy:
+				return
+			_attend_owner()
+			_joy_left = 2.5
+			match _variant(kind, 4):
+				0:
+					_queue_gesture("wave", 2.3, 1.0, true)
+				1:
+					_queue_gesture("wave", 2.0, -1.0, true)
+					_gesture_queue.append(["tilt", 1.2])
+				2:
+					_queue_gesture("hop", 1.0, 0.0, true)
+					_gesture_queue.append(["wave", 2.0])
+				_:
+					_queue_gesture("nod", 0.9, 0.0, true)
+					_gesture_queue.append(["wave", 1.8])
+		"arrived":
+			var away := _clock - _vision_last_seen
+			if _asleep:
+				_wake_for_reaction()
+				_queue_gesture("stretch", 3.2, 0.0, true)
+			elif not busy:
+				_attend_owner()
+				if away > 60.0:
+					_joy_left = 2.0
+					_queue_gesture(["wave", "hop", "wave"][_variant(kind, 3)], 2.2, 1.0, true)
+				else:
+					_queue_gesture(["tilt", "nod"][_variant(kind, 2)], 1.3, 0.0, true)
+		"left":
+			if not busy and not _asleep:
+				_queue_gesture("glance", 2.0)
+		"approached":
+			_surprise_left = 1.6
+			if not busy and _gesture == "":
+				_queue_gesture(["tilt", "shake_head", "nod"][_variant(kind, 3)], 1.3)
+		"looked_at_miko":
+			# Caught your eye: a small, warm acknowledgement.
+			if not busy and _gesture == "" and not _asleep:
+				_look_user = true
+				_joy_left = 1.8
+				_queue_gesture(["nod", "tilt", "hop"][_variant(kind, 3)], 1.0)
+		"looked_away":
+			if not busy and _gesture == "" and not _asleep:
+				_queue_gesture("glance", 2.0)
+		"covered":
+			# Someone put a hand over its eyes.
+			_blind = true
+			_surprise_left = 1.8
+			_wake_for_reaction()
+			_walking = false
+			_attend_owner()
+			match _variant(kind, 3):
+				0:
+					_queue_gesture("peer", 2.6, 0.0, true)
+				1:
+					_queue_gesture("cover_eyes", 2.4, 0.0, true)
+				_:
+					_queue_gesture("glance", 1.6, 0.0, true)
+					_gesture_queue.append(["shake_head", 1.1])
+		"uncovered":
+			# Peekaboo: there you are!
+			_blind = false
+			_wake_for_reaction()
+			_attend_owner()
+			_joy_left = 2.2
+			match _variant(kind, 3):
+				0:
+					_queue_gesture("hop", 1.1, 0.0, true)
+					_gesture_queue.append(["laugh", 1.6])
+				1:
+					_queue_gesture("laugh", 1.8, 0.0, true)
+				_:
+					_queue_gesture("tilt", 1.0, 0.0, true)
+					_gesture_queue.append(["wave", 1.8])
+		"shake_started", "shaken":
+			# The world started shaking: loses balance and wobbles while it lasts.
+			_wake_for_reaction()
+			_walking = false
+			_surprise_left = 1.2
+			_dizzy_left = 3.2
+			_queue_gesture("wobble", 2.2, 0.0, true)
+			if kind == "shaken":
+				_after_shake(2.0)
+		"shake_ended":
+			_after_shake(float(event.get("duration", 1.0)))
+		"orientation_changed":
+			_wake_for_reaction()
+			_surprise_left = 1.4
+			_queue_gesture(["startle", "tilt"][_variant(kind, 2)], 1.2, 0.0, true)
+		"light_changed":
+			if not busy:
+				_surprise_left = 1.0
+				_look_point = to_local(global_position) + Vector3(_rng.randf_range(-1.0, 1.0), 2.2, -1.5)
+				_look_user = false
+				_look_wait = 2.5
+				_queue_gesture("glance", 2.0)
+		"smiled":
+			# Smiles are contagious; usually just the face, sometimes more.
+			_joy_left = _rng.randf_range(2.0, 3.5)
+			if not busy and _gesture == "":
+				match _variant(kind, 4):
+					1:
+						_queue_gesture("tilt", 1.2)
+					2:
+						_queue_gesture("hop", 0.9)
+		"laughing":
+			_joy_left = 3.5
+			if not busy:
+				match _variant(kind, 3):
+					0:
+						_queue_gesture("laugh", 1.9, 0.0, true)
+					1:
+						_queue_gesture("hop", 0.9, 0.0, true)
+						_gesture_queue.append(["laugh", 1.5])
+					_:
+						_queue_gesture("laugh", 1.4, 0.0, true)
+						_gesture_queue.append(["hum", 1.6])
+		"yawned":
+			# Yawns are contagious too.
+			if not busy and _gesture == "" and _rng.randf() < 0.6:
+				_queue_gesture("yawn", 2.6, 0.0, true)
+			else:
+				_sleepy_left = 3.0
+		"surprised":
+			_surprise_left = 1.4
+			if not busy and _gesture == "":
+				_queue_gesture(["startle", "tilt"][_variant(kind, 2)], 1.0, 0.0, true)
+		"frowned":
+			# Concern: soft eyes, head tilted, sometimes comes a little closer.
+			_concern_left = 6.0
+			if not busy:
+				_attend_owner()
+				_queue_gesture("tilt", 1.8)
+				if _rng.randf() < 0.4 and _pos.distance_to(HOME) > 0.25:
+					_walk_to(HOME)
+		"eyes_closed":
+			_sleepy_left = 6.0
+			if not busy and _gesture == "":
+				_queue_gesture("glance", 1.6)
+		"eyes_opened":
+			_sleepy_left = 0.0
+			if not busy and _gesture == "":
+				_queue_gesture(["tilt", "nod"][_variant(kind, 2)], 1.0)
+		"winked":
+			_wink_left = 0.45
+			_joy_left = 2.0
+		"nodded":
+			if not busy and _gesture == "" and _rng.randf() < 0.7:
+				_queue_gesture("nod", 0.9)
+			_joy_left = maxf(_joy_left, 1.0)
+		"shook_head":
+			if not busy and _gesture == "":
+				_queue_gesture(["shake_head", "tilt"][_variant(kind, 2)], 1.1)
+		"tilted_head":
+			if not busy and _gesture == "" and _rng.randf() < 0.4:
+				_queue_gesture("tilt", 1.4, 1.0 if str(event.get("side", "")) == "left" else -1.0)
+		"looked_somewhere":
+			# Joint attention: look where they look.
+			if not busy and not _asleep:
+				var direction := str(event.get("direction", ""))
+				var offsets := {"left": Vector3(-1.8, -0.2, -0.6), "right": Vector3(1.8, -0.2, -0.6),
+					"up": Vector3(0.0, 1.4, -1.0), "down": Vector3(0.0, -0.9, 0.4)}
+				if offsets.has(direction):
+					_look_point = _camera_local() + offsets[direction]
+					_look_user = false
+					_look_wait = _rng.randf_range(1.8, 3.0)
+		"gesture":
+			_react_hand(str(event.get("gesture", "")), event, busy)
+		"someone_joined":
+			_surprise_left = 1.0
+			if not busy:
+				_queue_gesture("tilt", 1.2, 0.0, true)
+				_gesture_queue.append(["wave", 1.8])
+		"someone_left":
+			if not busy and _gesture == "":
+				_queue_gesture("glance", 1.8)
+		"motion", "scene_changed":
+			if not busy and not _asleep and _gesture == "":
+				# Something moved or changed over there: look that way.
+				var side := clampf(float(event.get("x", 0.0)), -1.0, 1.0)
+				_look_point = _camera_local() + Vector3(side * 1.6, -0.3, 0.0)
+				_look_user = false
+				_look_wait = 3.0 if kind == "scene_changed" else 2.2
+				_surprise_left = 0.8 if kind == "scene_changed" else 0.5
+				if kind == "scene_changed":
+					_queue_gesture("tilt", 1.4)
+
+
+## Once the shaking stops it copes its own way; bigger shakes, bigger recovery.
+## While the wobble is still playing, the recovery follows it.
+func _after_shake(duration: float) -> void:
+	_dizzy_left = maxf(_dizzy_left, clampf(duration, 0.8, 3.0))
+	var follow := _gesture == "wobble"
+	var pick := ""
+	if duration < 1.2:
+		pick = ["shake_head", "tilt"][_variant("shake_ended_short", 2)]
+	else:
+		match _variant("shake_ended", 3):
+			0:
+				pick = "shake_head"
+			1:
+				_plop_left = 2.6                # sits down hard, then gets up
+				_sit_goal = 1.0
+				return
+			_:
+				pick = "laugh"
+	var length := 1.1 if pick != "laugh" else 1.5
+	if follow:
+		_gesture_queue.append([pick, length])
+	else:
+		_queue_gesture(pick, length, 0.0, true)
+
+
+func _react_hand(gesture: String, event: Dictionary, busy: bool) -> void:
+	match gesture:
+		"thumbs_up":
+			_joy_left = 2.5
+			if not busy:
+				_attend_owner()
+				_queue_gesture("thumbs_up", 1.8, 1.0, true)
+				if _rng.randf() < 0.5:
+					_gesture_queue.append(["nod", 0.8])
+		"thumbs_down":
+			_concern_left = 3.5
+			if not busy:
+				_queue_gesture(["shrug", "shake_head"][_variant("thumbs_down", 2)], 1.3, 0.0, true)
+		"peace":
+			_joy_left = 2.5
+			if not busy:
+				_queue_gesture(["peace", "dance"][_variant("peace", 2)], 2.0 if _rng.randf() < 0.5 else 2.6, 1.0, true)
+		"open_palm":
+			# A raised palm: "stop!" when moving, otherwise a greeting.
+			if _walking or _command in ["walk_forward", "walk_back", "walk_left", "walk_right", "come_here", "go_away", "spin", "dance"]:
+				perform_command("stop")
+			elif not busy and _gesture == "":
+				_queue_gesture(["stop_palm", "wave"][_variant("open_palm", 2)], 1.6, 1.0, true)
+		"pointing":
+			# Look where the finger points; sometimes go have a look.
+			if not busy:
+				var side := clampf(float(event.get("x", 0.0)), -1.0, 1.0)
+				_look_point = _camera_local() + Vector3(side * 2.0, -0.4, -0.8)
+				_look_user = false
+				_look_wait = 2.6
+				if absf(side) > 0.4 and _rng.randf() < 0.4:
+					_walk_to(_pos + Vector2(signf(side) * 0.45, 0.0))
+		"fist":
+			if not busy:
+				_attend_owner()
+				_queue_gesture("fist_bump", 1.6, 1.0, true)
+		"love":
+			_joy_left = 3.5
+			if not busy:
+				_attend_owner()
+				_queue_gesture("hug", 2.2, 0.0, true)
+				_gesture_queue.append(["hop", 0.9])
+
+
+func _attend_owner() -> void:
+	_wake_for_reaction()
+	if not _sit_hold:
+		_sit_goal = 0.0
+	_walking = false
+	_look_user = true
+	_face_yaw_goal = _yaw_toward(_camera_local())
+	_behavior = "linger"
+	_behavior_left = _rng.randf_range(4.0, 7.0)
+
+
+## Pick one of `count` reaction variants, never the same as last time for
+## this event, so repeated events don't get a canned, identical response.
+func _variant(kind: String, count: int) -> int:
+	var last: int = _last_variant.get(kind, -1)
+	var pick := _rng.randi_range(0, count - 1)
+	if pick == last and count > 1:
+		pick = (pick + 1 + _rng.randi_range(0, count - 2)) % count
+	_last_variant[kind] = pick
+	return pick
 
 
 func _yaw_toward(point: Vector3) -> float:
@@ -290,6 +806,11 @@ func _update_behavior(delta: float, state: Dictionary) -> void:
 	if state["engaged"]:
 		_converse(delta, state)
 		return
+	if _command != "" or _sit_hold:
+		# Doing what the owner asked; only glance around meanwhile.
+		if _look_wait <= 0.0 and _command == "":
+			_pick_look_point()
+		return
 	if _asleep:
 		_look_user = false
 		_sleep_left -= delta
@@ -324,8 +845,9 @@ func _update_behavior(delta: float, state: Dictionary) -> void:
 
 func _converse(delta: float, state: Dictionary) -> void:
 	_look_user = true
-	_sit_goal = 0.0
-	if not _walking:
+	if not _sit_hold:
+		_sit_goal = 0.0
+	if not _walking and _command == "":
 		_face_yaw_goal = _yaw_toward(_camera_local())
 	if state["speaking"]:
 		_beat_wait -= delta
@@ -353,6 +875,8 @@ func _choose_behavior(state: Dictionary) -> void:
 		var weight: float = BEHAVIORS[name][0]
 		if _cooldowns.get(name, -999.0) > _clock:
 			continue
+		if name == "wave_user" and not arbiter.family_ready("greeting", _clock):
+			continue                            # just greeted for real: no idle wave on top
 		if not _history.is_empty() and _history[-1] == name:
 			continue
 		if _history.count(name) >= 2:
@@ -420,6 +944,7 @@ func _start_behavior(name: String) -> void:
 			_behavior_left = 3.0
 			_spin_left = TAU * (1.0 if _rng.randf() < 0.5 else -1.0)
 		"wave_user":
+			arbiter.note_autonomous("greeting", _clock, 30.0)
 			_behavior_left = 3.0
 			_look_user = true
 			_face_yaw_goal = _yaw_toward(_camera_local())
@@ -442,7 +967,9 @@ func _behavior_tick(_delta: float, _state: Dictionary) -> void:
 
 func _pick_look_point() -> void:
 	_look_wait = _rng.randf_range(1.4, 3.6)
-	if _rng.randf() < 0.3:
+	# Glance at the owner now and then; rarely if the camera sees nobody.
+	var nobody := _clock < _vision_fresh_until and not _vision_seen
+	if _rng.randf() < (0.06 if nobody else 0.3):
 		_look_user = true
 		return
 	_look_user = false
@@ -457,6 +984,145 @@ func _go_to_sleep() -> void:
 	_walk_to(DOCK)
 
 
+# ------------------------------------------------------------------ owner commands
+
+## Perform a body action the owner asked for (Realtime tool miko_perform_action).
+## Directions are from the owner's point of view: screen left/right, "forward"
+## toward the owner, "back" away from them.
+func perform_command(action: String, times: int = 1) -> void:
+	times = clampi(times, 1, 5)
+	if action not in ["sleep", "stop"] and (_asleep or _sleep_walk):
+		_asleep = false
+		_sleep_walk = false
+		_sit_goal = 0.0
+	if action not in ["sit", "think", "nod", "shake_head", "laugh", "look_around"]:
+		_release_sit()
+	_gesture_queue.clear()
+	_backward = false
+	_command = action
+	_command_left = 2.5
+	_look_user = true
+	match action:
+		"walk_forward":
+			_command_walk(_pick_forward_goal())
+		"walk_back":
+			_command_walk(_pos + Vector2(0.0, -0.6))
+			_backward = true                      # step back while facing you
+		"walk_left":
+			_command_walk(_pos + Vector2(-0.7, 0.0))
+		"walk_right":
+			_command_walk(_pos + Vector2(0.7, 0.0))
+		"come_here":
+			var camera := _camera_local()
+			_command_walk(Vector2(clampf(camera.x, STAGE_MIN.x + 0.3, STAGE_MAX.x - 0.3), STAGE_MAX.y - 0.08))
+		"go_away":
+			_command_walk(Vector2(_pos.x * 0.6, STAGE_MIN.y + 0.08))
+		"turn_around":
+			_walking = false
+			_spin_left = PI * (1.0 if _rng.randf() < 0.5 else -1.0)
+			_command_left = 4.0                   # show its back for a moment
+		"spin":
+			_walking = false
+			_spin_left = TAU * minf(times, 2) * (1.0 if _rng.randf() < 0.5 else -1.0)
+		"jump":
+			_queue_repeated("hop", 1.1, times)
+		"wave":
+			_face_yaw_goal = _yaw_toward(_camera_local())
+			_queue_repeated("wave", 2.3, mini(times, 2))
+		"nod":
+			_queue_repeated("nod", 1.0, times)
+		"shake_head":
+			_queue_repeated("shake_head", 1.2, times)
+		"dance":
+			_queue_repeated("dance", 3.6, mini(times, 2))
+		"stretch":
+			_queue_repeated("stretch", 3.4, 1)
+		"think":
+			_queue_repeated("think", 3.0, 1)
+		"laugh":
+			_queue_repeated("laugh", 1.9, 1)
+		"look_around":
+			_command_left = 5.0
+			_pick_look_point()
+			_look_user = false
+		"sit":
+			_walking = false
+			_sit_hold = true
+			_sit_hold_left = 120.0
+			_sit_goal = 1.0
+			_command = ""
+		"stand_up":
+			_command_left = 1.5
+		"sleep":
+			_command = ""
+			_go_to_sleep()
+		"wake_up":
+			_queue_repeated("stretch", 3.4, 1)
+		"stop", _:
+			_walking = false
+			_spin_left = 0.0
+			_gesture = ""
+			_command_left = 1.0
+			_face_yaw_goal = _yaw_toward(_camera_local())
+
+
+func _command_walk(goal: Vector2) -> void:
+	_gesture = ""
+	_walk_to(goal)
+	if not _walking:
+		# Already at the edge: a small shuffle and a look back says "can't go further".
+		_queue_gesture("shake_head", 1.1, 0.0, true)
+
+
+func _pick_forward_goal() -> Vector2:
+	var ahead := Vector2(sin(_yaw), cos(_yaw))
+	var goal := _pos + ahead * 0.65
+	var clamped := Vector2(clampf(goal.x, STAGE_MIN.x, STAGE_MAX.x), clampf(goal.y, STAGE_MIN.y, STAGE_MAX.y))
+	if clamped.distance_to(_pos) < 0.25:
+		# Facing a desk edge: walk across the desk instead.
+		goal = _pos + Vector2(-0.65 if _pos.x > 0.0 else 0.65, -0.2)
+	return goal
+
+
+func _queue_repeated(name: String, length: float, times: int) -> void:
+	_gesture = ""
+	for i in times:
+		_gesture_queue.append([name, length])
+	_command_left = 0.5
+
+
+func _release_sit() -> void:
+	_sit_hold = false
+	_sit_goal = 0.0
+
+
+func _update_command(delta: float) -> void:
+	if _plop_left > 0.0:
+		_plop_left -= delta
+		if _plop_left <= 0.0 and not _sit_hold:
+			_sit_goal = 0.0
+	if _sit_hold:
+		_sit_hold_left -= delta
+		if _sit_hold_left <= 0.0:
+			_release_sit()
+	if _gesture == "" and not _gesture_queue.is_empty():
+		var next: Array = _gesture_queue.pop_front()
+		_queue_gesture(next[0], next[1], 1.0 if next[0] == "wave" else 0.0, true)
+		_gesture_len = next[1]                  # repeated jumps keep an even rhythm
+	if _command == "":
+		return
+	var busy := _walking or _spin_left != 0.0 or _gesture != "" or not _gesture_queue.is_empty()
+	if busy:
+		return
+	_command_left -= delta
+	if _command_left <= 0.0:
+		_command = ""
+		_backward = false
+		_behavior = "linger"
+		_behavior_left = _rng.randf_range(3.0, 6.0)
+		_face_yaw_goal = _yaw_toward(_camera_local())
+
+
 # ------------------------------------------------------------------ locomotion
 
 func _walk_to(goal: Vector2) -> void:
@@ -465,45 +1131,63 @@ func _walk_to(goal: Vector2) -> void:
 	_sit_goal = 0.0
 
 
+func _steer(goal_rate: float, delta: float) -> float:
+	# Angular velocity eases in and out, so turns start and settle like a body
+	# with weight instead of snapping to a fixed rate.
+	_yaw_vel = move_toward(_yaw_vel, goal_rate, delta * 7.0)
+	_yaw += _yaw_vel * delta
+	return clampf(absf(_yaw_vel) / TURN_RATE, 0.0, 1.0)
+
+
 func _update_locomotion(delta: float) -> void:
 	var turning := 0.0
 	var can_move := _sit < 0.15 and _gesture not in ["hop", "stretch"]
+	var previous_speed := _speed
 	if _walking and can_move:
 		var to := _target - _pos
 		var distance := to.length()
-		if distance < 0.05:
+		if distance < 0.04:
 			_walking = false
 		else:
-			var dyaw := wrapf(atan2(to.x, to.y) - _yaw, -PI, PI)
-			var turn := clampf(dyaw, -TURN_RATE * delta, TURN_RATE * delta)
-			_yaw += turn
-			turning = absf(turn) / maxf(delta * TURN_RATE, 0.0001)
-			var align := clampf(1.0 - absf(dyaw) / 1.1, 0.0, 1.0)
-			var goal_speed := WALK_SPEED * align * clampf(distance / 0.3, 0.35, 1.0)
-			_speed = move_toward(_speed, goal_speed, delta * 1.3)
-			_pos += Vector2(sin(_yaw), cos(_yaw)) * _speed * delta
-	else:
-		_speed = move_toward(_speed, 0.0, delta * 1.8)
+			var heading := atan2(to.x, to.y) + (PI if _backward else 0.0)
+			var dyaw := wrapf(heading - _yaw, -PI, PI)
+			turning = _steer(clampf(dyaw * 3.0, -TURN_RATE, TURN_RATE), delta)
+			var align := clampf(1.0 - absf(dyaw) / 1.2, 0.0, 1.0)
+			# Slow down smoothly on approach (no abrupt stop at the target).
+			var arrive := clampf(distance / 0.35, 0.0, 1.0)
+			var goal_speed := WALK_SPEED * align * lerpf(0.25, 1.0, arrive) * (0.55 if _backward else 1.0)
+			_speed = move_toward(_speed, goal_speed, delta * 0.9)
+	if not (_walking and can_move):
+		_speed = move_toward(_speed, 0.0, delta * 1.1)
 		if _spin_left != 0.0 and can_move:
-			var spin := clampf(_spin_left, -TURN_RATE * 0.9 * delta, TURN_RATE * 0.9 * delta)
-			_yaw += spin
-			_spin_left -= spin
-			if absf(_spin_left) < 0.001:
+			var before := _yaw
+			turning = _steer(clampf(_spin_left * 2.5, -TURN_RATE * 0.85, TURN_RATE * 0.85), delta)
+			_spin_left -= _yaw - before
+			if absf(_spin_left) < 0.01:
 				_spin_left = 0.0
-			turning = 1.0
 		elif can_move:
 			var dyaw2 := wrapf(_face_yaw_goal - _yaw, -PI, PI)
 			# A person doesn't shuffle for tiny corrections; turn only when it matters.
-			if absf(dyaw2) > 0.32 or (absf(dyaw2) > 0.06 and _turn_hold > 0.0):
+			if absf(dyaw2) > 0.32 or (absf(dyaw2) > 0.05 and _turn_hold > 0.0):
 				_turn_hold = 0.4
-				var turn2 := clampf(dyaw2, -TURN_RATE * 0.7 * delta, TURN_RATE * 0.7 * delta)
-				_yaw += turn2
-				turning = absf(turn2) / maxf(delta * TURN_RATE * 0.7, 0.0001)
 			_turn_hold = maxf(0.0, _turn_hold - delta)
+			var rate := clampf(dyaw2 * 2.5, -TURN_RATE * 0.7, TURN_RATE * 0.7) if _turn_hold > 0.0 else 0.0
+			turning = _steer(rate, delta)
+		else:
+			_steer(0.0, delta)
+	_pos += Vector2(sin(_yaw), cos(_yaw)) * _speed * delta * (-1.0 if _backward else 1.0)
 	_pos = Vector2(clampf(_pos.x, STAGE_MIN.x, STAGE_MAX.x), clampf(_pos.y, STAGE_MIN.y, STAGE_MAX.y))
 	var gait := clampf(_speed / WALK_SPEED, 0.0, 1.0)
-	_step_amp = lerpf(_step_amp, maxf(gait, turning * 0.55), 1.0 - exp(-delta * 6.0))
-	_phase += delta * (TAU * _speed / STRIDE + turning * 7.0)
+	_step_amp = lerpf(_step_amp, maxf(gait, turning * 0.5), 1.0 - exp(-delta * 5.0))
+	# Phase follows distance covered: shorter, slower steps at low speed.
+	var stride := 4.0 * LEG * sin(THIGH_SWING * maxf(_step_amp, 0.35))
+	var phase_rate := TAU * _speed / maxf(stride, 0.05)
+	phase_rate = maxf(phase_rate, turning * 6.5)          # stepping in place while turning
+	_phase += delta * phase_rate * (-1.0 if _backward and _speed > 0.01 else 1.0)
+	# Lean into acceleration and a little into speed.
+	var accel := (_speed - previous_speed) / maxf(delta, 0.0001)
+	var lean_goal := (0.10 * gait + clampf(accel * 0.12, -0.06, 0.08)) * (-0.5 if _backward else 1.0)
+	_lean = lerpf(_lean, lean_goal, 1.0 - exp(-delta * 4.0))
 	_sit = move_toward(_sit, _sit_goal, delta * 0.9)
 	if _model != null:
 		_model.position = Vector3(_pos.x, 0.0, _pos.y)
@@ -515,6 +1199,10 @@ func _update_locomotion(delta: float) -> void:
 func _queue_gesture(name: String, length: float, side: float = 0.0, important: bool = false) -> void:
 	if _gesture != "" and not important:
 		return
+	if important:
+		# Reactions and commands (not speech beats or idle life) are logged.
+		MikoLog.info("ANIMATION", name, {"replaces": _gesture if _gesture != "" else "-",
+			"queued": _gesture_queue.size(), "command": _command if _command != "" else "-"})
 	_gesture = name
 	_gesture_t = 0.0
 	_gesture_len = maxf(0.3, length * _rng.randf_range(0.9, 1.15))
@@ -543,8 +1231,13 @@ func _gesture_pose(q: Dictionary, root: Array) -> Dictionary:
 		"wave":
 			override["upperarm." + arm] = e
 			override["forearm." + arm] = e
-			_add(q, "upperarm." + arm, Quaternion(FORWARD, s * 1.40 * e) * Quaternion(RIGHT, -0.55 * e))
-			_add(q, "forearm." + arm, Quaternion(FORWARD, s * (1.15 + 0.38 * sin(t * TAU * 3.5)) * e))
+			# Arm up beside the big helmet; the hand sways from the elbow and
+			# the wrist follows a beat later, like a relaxed human wave.
+			var sway := sin(t * TAU * 3.2)
+			_add(q, "upperarm." + arm, Quaternion(FORWARD, s * (1.30 + 0.04 * sway) * e) * Quaternion(RIGHT, -0.75 * e))
+			_add(q, "forearm." + arm, Quaternion(FORWARD, s * (0.80 + 0.42 * sway) * e))
+			override["hand." + arm] = e
+			_add(q, "hand." + arm, Quaternion(FORWARD, s * 0.30 * sin(t * TAU * 3.2 - 0.9) * e))
 			_add(q, "head", Quaternion(FORWARD, -s * 0.10 * e))
 			_add(q, "spine", Quaternion(FORWARD, -s * 0.05 * e))
 		"think":
@@ -611,6 +1304,88 @@ func _gesture_pose(q: Dictionary, root: Array) -> Dictionary:
 			_add(q, "head", Quaternion(RIGHT, 0.16 * sin(t * TAU * 2.0) * e))
 		"tilt":
 			_add(q, "head", Quaternion(FORWARD, s * 0.17 * e))
+		"peer":
+			# Leans in toward the covered lens, head cocking side to side.
+			_add(q, "spine", Quaternion(RIGHT, 0.12 * e))
+			_add(q, "head", Quaternion(RIGHT, 0.10 * e) * Quaternion(FORWARD, 0.20 * sin(t * TAU * 1.5) * e))
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(RIGHT, -0.40 * e) * Quaternion(FORWARD, k * 0.15 * e))
+				_add(q, "forearm." + side_name, Quaternion(RIGHT, -0.70 * e))
+		"yawn":
+			# Head back, arms out a little, a slow stretch of a yawn.
+			var y := _ease(t, 0.1, 0.4) * (1.0 - _ease(t, 0.7, 1.0))
+			_add(q, "head", Quaternion(RIGHT, -0.32 * y))
+			_add(q, "spine", Quaternion(RIGHT, -0.10 * y))
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["upperarm." + side_name] = y
+				_add(q, "upperarm." + side_name, Quaternion(FORWARD, k * 0.7 * y) * Quaternion(RIGHT, 0.25 * y))
+				_add(q, "forearm." + side_name, Quaternion(FORWARD, k * 0.5 * y))
+		"thumbs_up", "fist_bump", "stop_palm":
+			# One arm forward toward the owner (thumb, fist or palm).
+			var reach: float = {"thumbs_up": -1.15, "fist_bump": -1.35, "stop_palm": -1.45}[_gesture]
+			override["upperarm." + arm] = e
+			override["forearm." + arm] = e
+			var bump := 0.12 * sin(clampf((t - 0.45) / 0.2, 0.0, 1.0) * PI) if _gesture == "fist_bump" else 0.0
+			_add(q, "upperarm." + arm, Quaternion(RIGHT, (reach - bump) * e) * Quaternion(FORWARD, s * 0.15 * e))
+			_add(q, "forearm." + arm, Quaternion(RIGHT, (-0.45 if _gesture == "thumbs_up" else -0.15) * e))
+			if _gesture == "thumbs_up":
+				_add(q, "hand." + arm, Quaternion(FORWARD, s * 0.6 * e))
+			_add(q, "head", Quaternion(FORWARD, -s * 0.08 * e))
+		"peace":
+			# Arm up beside the head with a little bounce.
+			override["upperarm." + arm] = e
+			override["forearm." + arm] = e
+			root[0] += Vector3(0.0, 0.012 * absf(sin(t * TAU * 2.0)) * e, 0.0)
+			_add(q, "upperarm." + arm, Quaternion(FORWARD, s * 1.25 * e) * Quaternion(RIGHT, -0.6 * e))
+			_add(q, "forearm." + arm, Quaternion(FORWARD, s * 0.9 * e))
+			_add(q, "head", Quaternion(FORWARD, -s * 0.15 * e))
+		"hug":
+			# Arms wrap toward the chest, body sways happily.
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["upperarm." + side_name] = e
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(RIGHT, -0.75 * e) * Quaternion(FORWARD, k * 0.25 * e))
+				_add(q, "forearm." + side_name, Quaternion(RIGHT, -0.9 * e) * Quaternion(FORWARD, -k * 0.9 * e))
+			_add(q, "spine", Quaternion(FORWARD, 0.08 * sin(t * TAU * 1.5) * e))
+			_add(q, "head", Quaternion(FORWARD, 0.10 * sin(t * TAU * 1.5 + 0.5) * e))
+		"startle":
+			# A quick jolt back, then relax.
+			var jolt := sin(clampf(t / 0.35, 0.0, 1.0) * PI) * (1.0 - _ease(t, 0.35, 1.0)) + _ease(t, 0.0, 0.1) * (1.0 - _ease(t, 0.3, 0.6))
+			root[0] += Vector3(0.0, 0.02 * jolt, -0.025 * jolt)
+			_add(q, "spine", Quaternion(RIGHT, -0.12 * jolt))
+			_add(q, "head", Quaternion(RIGHT, -0.15 * jolt))
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				_add(q, "upperarm." + side_name, Quaternion(FORWARD, k * 0.45 * jolt))
+		"cover_eyes":
+			# Hands up over the visor: "I can't see!"
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["upperarm." + side_name] = e
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(RIGHT, -1.15 * e) * Quaternion(FORWARD, k * 0.35 * e))
+				_add(q, "forearm." + side_name, Quaternion(RIGHT, -1.05 * e) * Quaternion(FORWARD, -k * 0.55 * e))
+			_add(q, "head", Quaternion(FORWARD, 0.12 * sin(t * TAU * 1.2) * e) * Quaternion(RIGHT, 0.08 * e))
+		"wobble":
+			# Off balance: decaying sway, arms out to steady itself.
+			var decay := 1.0 - _ease(t, 0.15, 1.0)
+			var sway := sin(t * TAU * 3.0) * decay * e
+			root[0] += Vector3(0.025 * sway, -0.01 * absf(sway), 0.0)
+			_add(q, "hips", Quaternion(FORWARD, 0.14 * sway))
+			_add(q, "spine", Quaternion(FORWARD, -0.20 * sway) * Quaternion(RIGHT, 0.05 * e))
+			_add(q, "head", Quaternion(FORWARD, 0.22 * sin(t * TAU * 3.0 + 0.8) * decay * e))
+			for side_name in ["L", "R"]:
+				var k := -1.0 if side_name == "L" else 1.0
+				override["upperarm." + side_name] = e
+				override["forearm." + side_name] = e
+				_add(q, "upperarm." + side_name, Quaternion(FORWARD, k * (0.9 + 0.25 * sway * k) * e))
+				_add(q, "forearm." + side_name, Quaternion(FORWARD, k * 0.35 * e))
+		"shake_head":
+			_add(q, "head", Quaternion(UP, 0.32 * sin(t * TAU * 2.5) * e))
 		"hum":
 			_add(q, "head", Quaternion(FORWARD, 0.07 * sin(t * TAU * 4.0) * e) * Quaternion(RIGHT, 0.04 * sin(t * TAU * 8.0) * e))
 			_add(q, "spine", Quaternion(FORWARD, -0.03 * sin(t * TAU * 4.0) * e))
@@ -651,23 +1426,30 @@ func _compose_pose(delta: float, state: Dictionary) -> void:
 	var gait_l := sin(ph)
 	var gait_r := sin(ph + PI)
 
-	# Torso: breathing, weight shift, walking counter-rotation.
-	root[0] += Vector3(0.0, 0.009 * a * absf(cos(ph)), 0.0)
-	_add(base, "hips", Quaternion(FORWARD, 0.05 * a * gait_l + 0.025 * (1.0 - a) * drift))
-	_add(base, "spine", Quaternion(UP, 0.08 * a * gait_l) * Quaternion(RIGHT, 0.012 * breath + 0.03 * a) \
-		* Quaternion(FORWARD, -0.015 * (1.0 - a) * drift))
+	# Torso: breathing, weight shift, walking counter-rotation. The body dips
+	# at each foot contact and rises over the stance leg (two bobs per cycle),
+	# sways toward the supporting foot and leans into its speed.
+	root[0] += Vector3(0.012 * a * sin(ph), 0.010 * a * (0.5 - 0.5 * cos(2.0 * ph)) - 0.008 * a, 0.0)
+	root[0] += Vector3(0.006 * (1.0 - a) * drift, 0.0, 0.0)       # idle weight shift
+	_add(base, "hips", Quaternion(FORWARD, 0.045 * a * gait_l + 0.025 * (1.0 - a) * drift) * Quaternion(UP, -0.06 * a * gait_l))
+	_add(base, "spine", Quaternion(UP, 0.09 * a * gait_l) * Quaternion(RIGHT, 0.012 * breath + _lean) \
+		* Quaternion(FORWARD, -0.035 * a * gait_l - 0.015 * (1.0 - a) * drift))
 	for side_name in ["L", "R"]:
 		var k := -1.0 if side_name == "L" else 1.0
 		var g := gait_l if side_name == "L" else gait_r
-		var swing := maxf(0.0, cos(ph if side_name == "L" else ph + PI))
-		var thigh := -0.40 * a * g
-		var knee := 0.65 * a * swing
+		var c := cos(ph if side_name == "L" else ph + PI)
+		# Knee lifts smoothly in swing (leg travelling forward), soft in stance.
+		var swing := pow(maxf(0.0, c), 1.6)
+		var thigh := -THIGH_SWING * a * g - 0.10 * a * swing
+		var knee := 0.08 * a + 0.70 * a * swing
 		_add(base, "thigh." + side_name, Quaternion(RIGHT, thigh))
 		_add(base, "shin." + side_name, Quaternion(RIGHT, knee))
-		_add(base, "foot." + side_name, Quaternion(RIGHT, -0.35 * (thigh + knee)))
+		# Foot stays level on the ground; toes push off as the leg trails.
+		var toe_off := 0.25 * a * smoothstep(0.3, 1.0, -g) * (1.0 - swing)
+		_add(base, "foot." + side_name, Quaternion(RIGHT, -(thigh + knee) + toe_off))
 		# Arms hang relaxed and swing against the legs while walking.
-		_add(base, "upperarm." + side_name, Quaternion(FORWARD, k * (0.07 + 0.012 * breath)) * Quaternion(RIGHT, 0.30 * a * g))
-		_add(base, "forearm." + side_name, Quaternion(RIGHT, -0.12 - 0.18 * a))
+		_add(base, "upperarm." + side_name, Quaternion(FORWARD, k * (0.07 + 0.012 * breath + 0.03 * a)) * Quaternion(RIGHT, 0.32 * a * g))
+		_add(base, "forearm." + side_name, Quaternion(RIGHT, -0.12 - 0.16 * a - 0.10 * a * maxf(0.0, -g)))
 
 	# Sitting (rest / sleep): fold the legs forward and lower the body.
 	if _sit > 0.001:
@@ -700,12 +1482,23 @@ func _compose_pose(delta: float, state: Dictionary) -> void:
 	if _asleep:
 		want_yaw = 0.0
 		want_pitch = -0.30
-	_head = _head.lerp(Vector2(want_yaw, want_pitch), 1.0 - exp(-delta * (6.0 if state["engaged"] else 3.0)))
+	# Critically damped spring: the head eases out of rest and into the new
+	# target (no velocity jump when attention switches).
+	var w := 7.0 if state["engaged"] else 4.5
+	var dt := minf(delta, 0.05)
+	_head_vel += ((Vector2(want_yaw, want_pitch) - _head) * w * w - _head_vel * 2.0 * w) * dt
+	_head += _head_vel * dt
 	# Turn the whole body when the head would have to twist too far for long.
 	if absf(want_yaw) > 0.85 and not _walking and _gesture == "" and _sit < 0.2:
 		_face_yaw_goal = _yaw + want_yaw
 	_add(base, "spine", Quaternion(UP, _head.x * 0.22))
 	_add(base, "head", Quaternion(UP, _head.x * 0.70) * Quaternion(RIGHT, -_head.y * 0.75))
+	# Unconscious mimicry: a slow, partial echo of the owner's head tilt.
+	var want_roll := 0.0
+	if _vision_seen and _clock < _vision_fresh_until and _owner_looking and not _asleep:
+		want_roll = deg_to_rad(clampf(_owner_roll, -25.0, 25.0)) * 0.45
+	_mirror_roll = lerpf(_mirror_roll, want_roll, 1.0 - exp(-delta * 1.6))
+	_add(base, "head", Quaternion(FORWARD, _mirror_roll))
 	if state["listening"]:
 		_add(base, "head", Quaternion(FORWARD, 0.07 * sin(_clock * 0.6) + 0.06))
 		_add(base, "spine", Quaternion(RIGHT, 0.04))
@@ -761,12 +1554,47 @@ func _update_face(delta: float, state: Dictionary) -> void:
 		"shy":
 			goal["happy"] = 0.35
 			goal["smile"] = 0.3
-	if _gesture in ["laugh", "dance", "hop"] or (_gesture == "stretch" and _gesture_t > 0.3 and _gesture_t < 0.75):
+	if _gesture in ["laugh", "dance", "hop", "thumbs_up", "peace", "hug", "fist_bump"] or (_gesture == "stretch" and _gesture_t > 0.3 and _gesture_t < 0.75):
 		goal["happy"] = 1.0
 	if _gesture == "wave":
 		goal["smile"] = 0.8
 	if state["listening"]:
 		goal["size"] = maxf(goal["size"], 1.05)
+	_dizzy_left = maxf(0.0, _dizzy_left - delta)
+	_joy_left = maxf(0.0, _joy_left - delta)
+	# Emotional mirroring: Miko's face follows the owner's, softly.
+	if _vision_seen and _clock < _vision_fresh_until:
+		match _owner_expression:
+			"smiling":
+				goal["smile"] = maxf(goal["smile"], 0.7)
+				goal["happy"] = maxf(goal["happy"], 0.25)
+			"laughing":
+				goal["smile"] = maxf(goal["smile"], 0.9)
+				goal["happy"] = maxf(goal["happy"], 0.7)
+			"sad":
+				_concern_left = maxf(_concern_left, 0.5)
+			"surprised":
+				goal["surprise"] = maxf(goal["surprise"], 0.35)
+			"sleepy":
+				goal["open_base"] = minf(goal["open_base"], 0.75)
+	if _concern_left > 0.0:
+		goal["sad"] = maxf(goal["sad"], 0.4)
+		goal["smile"] = minf(goal["smile"], 0.05)
+	if _sleepy_left > 0.0 or _gesture == "yawn":
+		goal["open_base"] = minf(goal["open_base"], 0.15 if _gesture == "yawn" else 0.5)
+	if _joy_left > 0.0:
+		goal["smile"] = maxf(goal["smile"], 0.85)
+		goal["happy"] = maxf(goal["happy"], 0.55 * clampf(_joy_left, 0.0, 1.0))
+	if _blind:
+		goal["open_base"] = minf(goal["open_base"], 0.55)   # squinting at the dark
+		goal["sad"] = maxf(goal["sad"], 0.3)
+	if _dizzy_left > 0.0 and _surprise_left <= 0.0:
+		goal["size"] = 0.85
+		goal["smile"] = -0.1
+	_surprise_left = maxf(0.0, _surprise_left - delta)
+	if _surprise_left > 0.0:
+		goal["surprise"] = maxf(goal["surprise"], 0.7)
+		goal["size"] = maxf(goal["size"], 1.12)
 	if _asleep:
 		goal["open_base"] = 0.0
 		goal["power"] = 0.38
@@ -787,6 +1615,10 @@ func _update_face(delta: float, state: Dictionary) -> void:
 	var gaze := Vector2(clampf(_head.x * 0.9, -1.0, 1.0), clampf(_head.y * 1.4, -1.0, 1.0)) + _saccade
 	if _gesture == "think" or state["thinking"]:
 		gaze = Vector2(0.55 * _gesture_side, 0.75)
+	if _dizzy_left > 0.0:
+		# Seeing stars: eyes roll in small circles after a shake.
+		var spin := _dizzy_left * 7.0
+		gaze = Vector2(cos(spin), sin(spin)) * 0.55 * clampf(_dizzy_left, 0.0, 1.0)
 	# Mouth: only speech opens it (one drawn shape, nothing painted beneath).
 	var mouth_open := 0.0
 	var mouth_round := 0.0
@@ -797,12 +1629,16 @@ func _update_face(delta: float, state: Dictionary) -> void:
 		mouth_wide = _num(state["wide"])
 	elif _gesture == "laugh":
 		mouth_open = 0.55 + 0.25 * absf(sin(_gesture_t * TAU * 5.0))
+	elif _gesture == "yawn":
+		mouth_open = 0.95 * _ease(_gesture_t, 0.1, 0.35) * (1.0 - _ease(_gesture_t, 0.7, 0.95))
+		mouth_round = 0.8
 	_speak_energy = lerpf(_speak_energy, mouth_open, 1.0 - exp(-delta * 6.0))
 
 	var values := {
 		"happy": goal["happy"], "sad": goal["sad"], "angry": goal["angry"], "surprise": goal["surprise"],
 		"mouth_smile": goal["smile"], "eye_size": goal["size"], "power": goal["power"],
-		"eye_open_l": float(goal["open_base"]) * (1.0 - blink), "eye_open_r": float(goal["open_base"]) * (1.0 - blink),
+		"eye_open_l": float(goal["open_base"]) * (1.0 - blink) * (0.0 if _wink_left > 0.0 else 1.0),
+		"eye_open_r": float(goal["open_base"]) * (1.0 - blink),
 		"mouth_open": mouth_open, "mouth_round": mouth_round, "mouth_wide": mouth_wide,
 	}
 	for key in values:
@@ -846,19 +1682,8 @@ func _apply_materials() -> void:
 		if mesh_instance.mesh == null or mesh_instance.material_override != null:
 			continue
 		mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		# Two-tone plastic from the baked whiteness field (no texture atlas).
+		var material := ShaderMaterial.new()
+		material.shader = BODY_SHADER
 		for surface in mesh_instance.mesh.get_surface_count():
-			var source := mesh_instance.mesh.surface_get_material(surface) as StandardMaterial3D
-			if source == null:
-				continue
-			# Satin toy plastic: keep color and normal maps; the source's
-			# roughness map is near zero and reads as chrome, so replace it.
-			var material := source.duplicate() as StandardMaterial3D
-			material.metallic = 0.0
-			material.metallic_texture = null
-			material.roughness_texture = null
-			material.roughness = 0.42
-			material.metallic_specular = 0.38
-			material.clearcoat_enabled = true
-			material.clearcoat = 0.18
-			material.clearcoat_roughness = 0.35
 			mesh_instance.set_surface_override_material(surface, material)

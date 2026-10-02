@@ -26,6 +26,14 @@ import uuid
 from typing import Any, Mapping
 
 
+# Physical actions Miko's body can perform on request (Godot robot and device).
+BODY_ACTIONS = (
+    "walk_forward", "walk_back", "walk_left", "walk_right", "come_here", "go_away",
+    "turn_around", "spin", "jump", "wave", "dance", "nod", "shake_head", "sit",
+    "stand_up", "stretch", "think", "laugh", "look_around", "sleep", "wake_up", "stop",
+)
+
+
 def _schema(properties: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "object",
@@ -87,6 +95,29 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         }),
     },
     {
+        "type": "function", "name": "miko_perform_action",
+        "description": (
+            "Make Miko's body do something the owner asked for: walk, come closer, jump, wave, "
+            "dance, sit, spin, nod, etc. Call it right away for any physical request "
+            "('תלך', 'תבוא אליי', 'תקפוץ', 'תעשה שלום', 'שב', 'תסתובב', 'עצור'). "
+            "Directions are from the owner's point of view. Returns when the motion has started."
+        ),
+        "parameters": _schema({
+            "action": {"type": "string", "enum": list(BODY_ACTIONS)},
+            "times": {"type": "integer", "minimum": 1, "maximum": 5,
+                      "description": "Repetitions for jump/wave/nod/spin; 1 if not said."},
+        }),
+    },
+    {
+        "type": "function", "name": "miko_get_vision",
+        "description": (
+            "What Miko's camera perception currently knows about the owner: whether someone is "
+            "in view, roughly where, how close, and recent events like a wave. Derived locally; "
+            "no image is sent. Use it when asked 'do you see me', 'where am I', 'did you see me wave'."
+        ),
+        "parameters": _schema({}),
+    },
+    {
         "type": "function", "name": "miko_prepare_email",
         "description": "Start or edit an email task. A spoken address may be tentative; return a factual draft for natural readback. This tool never sends.",
         "parameters": _schema({
@@ -134,6 +165,8 @@ class MikoRealtimeTools:
     """
 
     CONFIRMATION_MAX_AGE_SECONDS = 90
+    # Set by the host when local camera perception runs: () -> dict summary.
+    vision_provider = None
 
     def __init__(self, brain: Any):
         self.brain = brain
@@ -198,6 +231,8 @@ class MikoRealtimeTools:
             "miko_remember": self.remember,
             "miko_get_status": self.get_status,
             "miko_set_expression": self.set_expression,
+            "miko_perform_action": self.perform_action,
+            "miko_get_vision": self.get_vision,
             "miko_prepare_email": self.prepare_email,
             "miko_pause_email": self.pause_email,
             "miko_resume_email": self.resume_email,
@@ -382,6 +417,29 @@ class MikoRealtimeTools:
             self.brain.set_current_emotion(emotion, 60)
             self.brain.save_state()
         return {"ok": True, "status": "expression_set", "emotion": emotion, "action": action}
+
+    def perform_action(self, action: str, times: int = 1) -> dict[str, Any]:
+        if action not in BODY_ACTIONS:
+            return {"ok": False, "status": "invalid_action"}
+        try:
+            times = max(1, min(5, int(times)))
+        except (TypeError, ValueError):
+            times = 1
+        if action == "sleep":
+            with self.brain.state_lock:
+                self.brain.set_current_emotion("sleepy", 60)
+        # The host forwards this result to Godot and the paired device, which
+        # animate it. The result is a fact for the model, not a phrase.
+        return {"ok": True, "status": "performing", "action": action, "times": times}
+
+    def get_vision(self) -> dict[str, Any]:
+        provider = type(self).vision_provider
+        if provider is None:
+            return {"ok": True, "status": "camera_off", "seen": False}
+        try:
+            return {"ok": True, **provider()}
+        except Exception:
+            return {"ok": False, "status": "vision_unavailable"}
 
     def get_status(self) -> dict[str, Any]:
         state = self._snapshot()

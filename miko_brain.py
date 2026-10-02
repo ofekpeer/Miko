@@ -36,7 +36,7 @@ for _miko_stream in (sys.stdout, sys.stderr):
 # SETTINGS
 # ==================================================
 
-BRAIN_VERSION = "AUTONOMY-17.2-CONFIRMATION-HOME"
+BRAIN_VERSION = "AUTONOMY-17.8-SEES"
 
 RECENT_CONVERSATION_SECONDS = 300
 DEVICE_ONLINE_SECONDS = 12

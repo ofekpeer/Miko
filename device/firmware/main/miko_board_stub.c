@@ -17,3 +17,8 @@ void miko_board_camera_prompt(uint32_t e) { (void)e; }
 bool miko_board_camera_confirmed(void) { return false; }
 esp_err_t miko_board_camera_capture(uint8_t **j, size_t *n) { (void)j; (void)n; return ESP_ERR_NOT_SUPPORTED; }
 void miko_board_camera_discard(uint8_t *j) { (void)j; }
+esp_err_t miko_board_vision_start(uint32_t f, uint32_t w, uint32_t h) { (void)f; (void)w; (void)h; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t miko_board_vision_frame(uint8_t **j, size_t *n) { (void)j; (void)n; return ESP_ERR_NOT_FOUND; }
+void miko_board_vision_discard(uint8_t *j) { (void)j; }
+void miko_board_vision_stop(void) {}
+esp_err_t miko_board_imu_read(miko_imu_sample_t *s) { (void)s; return ESP_ERR_NOT_FOUND; }

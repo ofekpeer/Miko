@@ -73,6 +73,17 @@ var realtime_last_browser_open_msec := -2000
 var miko_preview_mode := false
 var realtime_transcript_turns: Array[Dictionary] = []
 var realtime_caption_offsets: Dictionary = {}
+## Chat bubbles (Apple Messages style). realtime_transcript_label keeps the
+## plain text of the conversation (logs/tests); the bubbles are what is shown.
+var realtime_bubbles: VBoxContainer
+var realtime_bubble_rows: Array = []          # [row HBox, bubble Panel, Label, is_owner]
+var realtime_caption_bubbles: Dictionary = {}  # caption key -> Label
+var realtime_status_pill: PanelContainer
+var realtime_status_dot: Panel
+var miko_ui_font: Font
+const UI_BLUE := Color(0.04, 0.52, 1.0)        # iOS system blue
+const UI_GREY_BUBBLE := Color(0.23, 0.23, 0.25, 0.96)
+const UI_CARD := Color(0.07, 0.07, 0.08, 0.80)
 var realtime_presented_captions: Dictionary = {}
 var realtime_session_order: Dictionary = {}
 var realtime_next_session_order := 0
@@ -204,6 +215,10 @@ var barge_in_cooldown := 0.0
 const BARGE_IN_COOLDOWN_SECONDS := 0.18
 
 var action_playing := false
+var vision_enabled := true
+var vision_available := false
+var vision_error := ""
+var realtime_camera_button: Button
 var sleeping_pose := false
 
 # These belong to the ONE speech request currently in flight.
@@ -216,6 +231,9 @@ func _ready() -> void:
 	miko_preview_mode = OS.get_cmdline_user_args().has("--miko-preview") or OS.get_cmdline_args().has("--miko-preview")
 	if not miko_preview_mode:
 		get_window().min_size = Vector2i(360, 420)
+		# Visible version, so it is obvious which build is actually running.
+		get_window().title = "Miko 17.8"
+		print("MIKO VERSION: 17.8")
 	if animation_player == null:
 		push_error("Miko AnimationPlayer was not found at MikoScene/AnimationPlayer.")
 		return
@@ -224,6 +242,10 @@ func _ready() -> void:
 		_on_animation_finished
 	)
 
+	var guardian = preload("res://miko_guardian.gd").new()
+	guardian.name = "MikoGuardian"
+	guardian.setup(self)
+	add_child(guardian)
 	_setup_robot_features()
 	_setup_expression_system()
 	if presence != null:
@@ -1657,6 +1679,9 @@ func _setup_microphone() -> void:
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.keycode == KEY_F8 and event.pressed and not event.echo:
 		_open_voice_conversation()
+		get_viewport().set_input_as_handled()
+	if event is InputEventKey and event.keycode == KEY_F7 and event.pressed and not event.echo:
+		_toggle_vision()
 		get_viewport().set_input_as_handled()
 
 
@@ -5037,8 +5062,21 @@ func _setup_realtime_voice() -> void:
 	realtime_voice.turn_started.connect(_on_realtime_turn_started)
 	realtime_voice.speaking_changed.connect(_on_realtime_speaking)
 	realtime_voice.tool_result.connect(_on_realtime_tool)
+	realtime_voice.vision_update.connect(_on_realtime_vision)
 	_setup_voice_controls()
 	add_child(realtime_voice)
+
+
+func _ui_font() -> Font:
+	if miko_ui_font == null:
+		var font := SystemFont.new()
+		# Apple's font where present; Segoe UI Variable/Segoe UI on Windows (both have Hebrew).
+		font.font_names = PackedStringArray(["SF Pro Display", "SF Pro Text", "Segoe UI Variable Display",
+			"Segoe UI", "Rubik", "Heebo", "Arial"])
+		font.font_weight = 500
+		font.antialiasing = TextServer.FONT_ANTIALIASING_LCD
+		miko_ui_font = font
+	return miko_ui_font
 
 
 func _setup_voice_controls() -> void:
@@ -5048,20 +5086,25 @@ func _setup_voice_controls() -> void:
 	var panel := PanelContainer.new()
 	realtime_voice_panel = panel
 	panel.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
-	panel.offset_top = -198.0
+	panel.offset_top = -214.0
 	panel.offset_left = 14.0
 	panel.offset_right = -14.0
 	panel.offset_bottom = -12.0
 	layer.add_child(panel)
+	# A dark, translucent "material" card with soft corners and shadow.
 	var surface := StyleBoxFlat.new()
-	surface.bg_color = Color(0.055, 0.085, 0.115, 0.95)
-	surface.border_color = Color(0.30, 0.73, 0.81, 0.65)
+	surface.bg_color = UI_CARD
+	surface.border_color = Color(1, 1, 1, 0.08)
 	surface.set_border_width_all(1)
-	surface.set_corner_radius_all(16)
-	surface.set_content_margin_all(12)
+	surface.set_corner_radius_all(24)
+	surface.set_content_margin_all(14)
+	surface.shadow_color = Color(0, 0, 0, 0.35)
+	surface.shadow_size = 18
+	surface.shadow_offset = Vector2(0, 6)
+	surface.anti_aliasing = true
 	panel.add_theme_stylebox_override("panel", surface)
 	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 8)
+	box.add_theme_constant_override("separation", 10)
 	panel.add_child(box)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 8)
@@ -5071,9 +5114,9 @@ func _setup_voice_controls() -> void:
 	talk_button.text = "החזק כדי לדבר"
 	talk_button.tooltip_text = "החזק כדי לדבר, או החזק SPACE"
 	talk_button.focus_mode = Control.FOCUS_NONE
-	talk_button.custom_minimum_size = Vector2(84, 38)
+	talk_button.custom_minimum_size = Vector2(96, 40)
 	talk_button.add_theme_font_size_override("font_size", 15)
-	_style_voice_button(talk_button, Color(0.10, 0.37, 0.43, 1.0))
+	_style_voice_button(talk_button, UI_BLUE)
 	if realtime_voice == null:
 		talk_button.disabled = true
 	else:
@@ -5088,23 +5131,59 @@ func _setup_voice_controls() -> void:
 	# A focused Button would otherwise launch a browser tab on every turn.
 	open_button.focus_mode = Control.FOCUS_NONE
 	open_button.disabled = miko_preview_mode
-	open_button.custom_minimum_size = Vector2(78, 38)
+	open_button.custom_minimum_size = Vector2(84, 40)
 	open_button.add_theme_font_size_override("font_size", 15)
-	_style_voice_button(open_button, Color(0.14, 0.20, 0.27, 1.0))
+	_style_voice_button(open_button, Color(0.23, 0.23, 0.25, 1.0))
 	open_button.pressed.connect(_open_voice_conversation)
 	row.add_child(open_button)
+	realtime_camera_button = Button.new()
+	realtime_camera_button.focus_mode = Control.FOCUS_NONE
+	realtime_camera_button.custom_minimum_size = Vector2(76, 40)
+	realtime_camera_button.add_theme_font_size_override("font_size", 14)
+	realtime_camera_button.add_theme_font_override("font", _ui_font())
+	realtime_camera_button.disabled = miko_preview_mode
+	realtime_camera_button.pressed.connect(_toggle_vision)
+	row.add_child(realtime_camera_button)
+	_refresh_camera_button()
+	# Status capsule: a coloured dot and a short state ("מקשיב", "חושב"...).
+	var pill := PanelContainer.new()
+	realtime_status_pill = pill
+	pill.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var pill_style := StyleBoxFlat.new()
+	pill_style.bg_color = Color(1, 1, 1, 0.06)
+	pill_style.set_corner_radius_all(20)
+	pill_style.content_margin_left = 14
+	pill_style.content_margin_right = 14
+	pill_style.content_margin_top = 6
+	pill_style.content_margin_bottom = 6
+	pill_style.anti_aliasing = true
+	pill.add_theme_stylebox_override("panel", pill_style)
+	row.add_child(pill)
+	var pill_row := HBoxContainer.new()
+	pill_row.add_theme_constant_override("separation", 8)
+	pill_row.alignment = BoxContainer.ALIGNMENT_END
+	pill.add_child(pill_row)
 	realtime_status_label = Label.new()
 	realtime_status_label.text = "תצוגה מקדימה" if miko_preview_mode else "SPACE: לדבר · F8: שיחה בלי לחצן"
 	realtime_status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	realtime_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	realtime_status_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	realtime_status_label.text_direction = Control.TEXT_DIRECTION_RTL
-	realtime_status_label.add_theme_font_size_override("font_size", 16)
-	realtime_status_label.add_theme_color_override("font_color", Color(0.78, 0.94, 0.97))
+	realtime_status_label.add_theme_font_override("font", _ui_font())
+	realtime_status_label.add_theme_font_size_override("font_size", 15)
+	realtime_status_label.add_theme_color_override("font_color", Color(0.92, 0.92, 0.96))
 	realtime_status_label.clip_text = true
-	row.add_child(realtime_status_label)
-	var separator := HSeparator.new()
-	box.add_child(separator)
+	pill_row.add_child(realtime_status_label)
+	var dot := Panel.new()
+	realtime_status_dot = dot
+	dot.custom_minimum_size = Vector2(9, 9)
+	dot.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var dot_style := StyleBoxFlat.new()
+	dot_style.bg_color = Color(0.56, 0.56, 0.58)
+	dot_style.set_corner_radius_all(5)
+	dot_style.anti_aliasing = true
+	dot.add_theme_stylebox_override("panel", dot_style)
+	pill_row.add_child(dot)
 	var transcript_scroll := ScrollContainer.new()
 	realtime_transcript_scroll = transcript_scroll
 	transcript_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -5112,19 +5191,22 @@ func _setup_voice_controls() -> void:
 	transcript_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
 	transcript_scroll.follow_focus = true
 	box.add_child(transcript_scroll)
+	var column := VBoxContainer.new()
+	column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	column.add_theme_constant_override("separation", 6)
+	transcript_scroll.add_child(column)
+	realtime_bubbles = VBoxContainer.new()
+	realtime_bubbles.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	realtime_bubbles.add_theme_constant_override("separation", 6)
+	column.add_child(realtime_bubbles)
+	# Plain text of the conversation (not drawn; logs and tests read it).
 	realtime_transcript_label = Label.new()
+	realtime_transcript_label.visible = false
 	realtime_transcript_label.text_direction = Control.TEXT_DIRECTION_RTL
-	# Godot mirrors Label alignment in RTL mode: LEFT draws at the visual right.
-	realtime_transcript_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	realtime_transcript_label.vertical_alignment = VERTICAL_ALIGNMENT_TOP
-	realtime_transcript_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	realtime_transcript_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	realtime_transcript_label.add_theme_font_size_override("font_size", 16)
-	realtime_transcript_label.add_theme_color_override("font_color", Color(0.96, 0.98, 1.0))
-	realtime_transcript_label.add_theme_constant_override("line_spacing", 5)
+	column.add_child(realtime_transcript_label)
 	if miko_preview_mode:
 		realtime_transcript_label.text = "השיחה תופיע כאן אחרי שתדבר עם מיקו."
-	transcript_scroll.add_child(realtime_transcript_label)
+		_render_realtime_bubbles([["miko", "השיחה תופיע כאן אחרי שתדבר עם מיקו.", ""]])
 	transcript_scroll.resized.connect(_fit_realtime_transcript_width)
 	get_viewport().size_changed.connect(_update_realtime_voice_layout)
 	_update_realtime_voice_layout()
@@ -5134,17 +5216,98 @@ func _setup_voice_controls() -> void:
 func _style_voice_button(button: Button, fill: Color) -> void:
 	var normal := StyleBoxFlat.new()
 	normal.bg_color = fill
-	normal.set_corner_radius_all(9)
-	normal.set_content_margin_all(7)
+	normal.set_corner_radius_all(20)                 # capsule
+	normal.content_margin_left = 16
+	normal.content_margin_right = 16
+	normal.content_margin_top = 8
+	normal.content_margin_bottom = 8
+	normal.anti_aliasing = true
 	button.add_theme_stylebox_override("normal", normal)
 	var hover := normal.duplicate() as StyleBoxFlat
-	hover.bg_color = fill.lightened(0.14)
+	hover.bg_color = fill.lightened(0.10)
 	button.add_theme_stylebox_override("hover", hover)
 	var pressed := normal.duplicate() as StyleBoxFlat
-	pressed.bg_color = fill.darkened(0.12)
+	pressed.bg_color = fill.darkened(0.18)
 	button.add_theme_stylebox_override("pressed", pressed)
-	button.add_theme_color_override("font_color", Color(0.96, 0.99, 1.0))
+	var disabled := normal.duplicate() as StyleBoxFlat
+	disabled.bg_color = Color(fill.r, fill.g, fill.b, 0.35)
+	button.add_theme_stylebox_override("disabled", disabled)
+	button.add_theme_font_override("font", _ui_font())
+	button.add_theme_color_override("font_color", Color(1, 1, 1))
 	button.add_theme_color_override("font_hover_color", Color.WHITE)
+	button.add_theme_color_override("font_pressed_color", Color(1, 1, 1, 0.85))
+
+
+## iMessage-style rows: the owner's bubbles in blue on one side, Miko's in
+## grey on the other (mirrored for Hebrew, as on an iPhone set to Hebrew).
+func _render_realtime_bubbles(entries: Array) -> void:
+	if realtime_bubbles == null:
+		return
+	realtime_caption_bubbles.clear()
+	var width := maxf(160.0, (realtime_transcript_scroll.size.x if realtime_transcript_scroll != null else 600.0) - 18.0)
+	for index in range(entries.size()):
+		var entry: Array = entries[index]
+		var owner := str(entry[0]) == "owner"
+		if index >= realtime_bubble_rows.size():
+			realtime_bubble_rows.append(_make_bubble_row())
+		var parts: Array = realtime_bubble_rows[index]
+		var row: HBoxContainer = parts[0]
+		var bubble: PanelContainer = parts[1]
+		var label: Label = parts[2]
+		row.visible = true
+		if parts[3] != owner:
+			parts[3] = owner
+			_style_bubble(bubble, label, owner)
+		label.text = str(entry[1])
+		# Long lines wrap inside ~78% of the card, short ones stay compact.
+		var limit := width * 0.78
+		var natural := label.get_theme_font("font").get_string_size(label.text, HORIZONTAL_ALIGNMENT_LEFT, -1,
+			label.get_theme_font_size("font_size")).x + 2.0
+		label.custom_minimum_size = Vector2(minf(limit, natural), 0.0)
+		label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART if natural > limit else TextServer.AUTOWRAP_OFF
+		row.alignment = BoxContainer.ALIGNMENT_END if owner else BoxContainer.ALIGNMENT_BEGIN
+		if str(entry[2]) != "":
+			realtime_caption_bubbles[str(entry[2])] = label
+	for index in range(entries.size(), realtime_bubble_rows.size()):
+		(realtime_bubble_rows[index][0] as HBoxContainer).visible = false
+
+
+func _make_bubble_row() -> Array:
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Layout is mirrored for RTL: ALIGNMENT_BEGIN is the right side.
+	row.layout_direction = Control.LAYOUT_DIRECTION_RTL
+	var bubble := PanelContainer.new()
+	var label := Label.new()
+	label.text_direction = Control.TEXT_DIRECTION_RTL
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	label.add_theme_font_override("font", _ui_font())
+	label.add_theme_font_size_override("font_size", 16)
+	label.add_theme_constant_override("line_spacing", 3)
+	bubble.add_child(label)
+	row.add_child(bubble)
+	realtime_bubbles.add_child(row)
+	var parts := [row, bubble, label, false]
+	_style_bubble(bubble, label, false)
+	return parts
+
+
+func _style_bubble(bubble: PanelContainer, label: Label, owner: bool) -> void:
+	var style := StyleBoxFlat.new()
+	style.bg_color = UI_BLUE if owner else UI_GREY_BUBBLE
+	style.set_corner_radius_all(18)
+	# The "tail" corner is tighter, like Messages.
+	if owner:
+		style.corner_radius_bottom_left = 6
+	else:
+		style.corner_radius_bottom_right = 6
+	style.content_margin_left = 13
+	style.content_margin_right = 13
+	style.content_margin_top = 8
+	style.content_margin_bottom = 9
+	style.anti_aliasing = true
+	bubble.add_theme_stylebox_override("panel", style)
+	label.add_theme_color_override("font_color", Color(1, 1, 1) if owner else Color(0.95, 0.95, 0.97))
 
 
 func _fit_realtime_transcript_width() -> void:
@@ -5153,7 +5316,9 @@ func _fit_realtime_transcript_width() -> void:
 	# ScrollContainer does not stretch a Label beyond its intrinsic text width.
 	# Reserve the scrollbar and give Hebrew right alignment the full card width.
 	var available := maxf(0.0, realtime_transcript_scroll.size.x - 14.0)
-	realtime_transcript_label.custom_minimum_size = Vector2(available, 0.0)
+	if realtime_bubbles != null:
+		realtime_bubbles.custom_minimum_size = Vector2(available, 0.0)
+		_refresh_realtime_transcript()
 
 
 func _update_realtime_voice_layout() -> void:
@@ -5172,7 +5337,7 @@ func _update_realtime_voice_layout() -> void:
 		realtime_voice_panel.offset_left = 8.0
 		realtime_voice_panel.offset_right = -8.0
 	else:
-		realtime_voice_panel.offset_top = -172.0 if viewport_size.y < 720.0 else -198.0
+		realtime_voice_panel.offset_top = -212.0 if viewport_size.y < 720.0 else -268.0
 		realtime_voice_panel.offset_bottom = -12.0
 		realtime_voice_panel.offset_left = 14.0
 		realtime_voice_panel.offset_right = -14.0
@@ -5191,22 +5356,26 @@ func _refresh_realtime_status_label() -> void:
 	if realtime_status_label == null:
 		return
 	var display_state := "speaking" if voice_active else realtime_display_status
-	var tint := Color(0.76, 0.91, 0.94)
+	var tint := Color(0.56, 0.56, 0.58)                # idle: system grey
 	match display_state:
 		"listening", "finishing":
-			tint = Color(0.43, 0.94, 0.96)
-		"thinking":
-			tint = Color(0.96, 0.83, 0.54)
+			tint = Color(1.0, 0.27, 0.23)                 # mic live: system red
+		"thinking", "connecting":
+			tint = Color(1.0, 0.62, 0.04)                 # system orange
 		"speaking":
-			tint = Color(0.54, 0.95, 0.80)
+			tint = Color(0.19, 0.82, 0.35)                # system green
 		"error", "disconnected":
-			tint = Color(1.0, 0.68, 0.61)
-	realtime_status_label.add_theme_color_override("font_color", tint)
+			tint = Color(1.0, 0.84, 0.04)                 # system yellow
+	realtime_status_label.add_theme_color_override("font_color", Color(0.93, 0.93, 0.96))
+	if realtime_status_dot != null:
+		var dot_style := realtime_status_dot.get_theme_stylebox("panel") as StyleBoxFlat
+		if dot_style != null:
+			dot_style.bg_color = tint
 	if miko_preview_mode:
 		realtime_status_label.text = "תצוגה" if realtime_compact_ui else "תצוגה מקדימה"
 		return
 	if voice_active:
-		realtime_status_label.text = "● מדבר" if realtime_compact_ui or realtime_medium_ui else "● מיקו מדבר · אפשר להפריע"
+		realtime_status_label.text = "מדבר" if realtime_compact_ui or realtime_medium_ui else "מיקו מדבר · אפשר להפריע"
 		return
 	var pending_turn: bool = realtime_voice != null and realtime_voice.is_listening()
 	var keep_listening: bool = pending_turn and realtime_display_status in ["idle", "ready"]
@@ -5220,7 +5389,7 @@ func _refresh_realtime_status_label() -> void:
 		var short_state := "מקשיב" if keep_listening else str(compact_labels.get(realtime_display_status, "מוכן"))
 		if realtime_medium_ui and not realtime_narrow_ui and realtime_display_status in ["idle", "ready"] and not keep_listening:
 			short_state = "SPACE · " + short_state
-		realtime_status_label.text = "● " + short_state
+		realtime_status_label.text = short_state
 		return
 	var labels := {
 		"idle": "מוכן · SPACE: לדבר · F8: שיחה פתוחה",
@@ -5235,7 +5404,7 @@ func _refresh_realtime_status_label() -> void:
 		"error": "תקלה בקול: ",
 		"disconnected": "המוח מנותק — הפעל את Miko",
 	}
-	realtime_status_label.text = "● " + ("מקשיב…" if keep_listening else str(labels.get(realtime_display_status, realtime_display_detail)) + (realtime_display_detail if realtime_display_status == "error" else ""))
+	realtime_status_label.text = ("מקשיב…" if keep_listening else str(labels.get(realtime_display_status, realtime_display_detail)) + (realtime_display_detail if realtime_display_status == "error" else ""))
 
 
 func _open_voice_conversation() -> void:
@@ -5313,6 +5482,19 @@ func _on_realtime_transcript(role: String, text: String, turn_id: String, turn_n
 	var clean := text.strip_edges()
 	if clean.is_empty() or role not in ["user", "assistant"]:
 		return
+	if turn_id.is_empty() and role == "assistant" and not item_id.is_empty():
+		# A reply without an owner turn: keep every caption update of the same
+		# item in one place instead of opening a new row per update.
+		for existing_index in range(realtime_transcript_turns.size()):
+			var existing: Dictionary = realtime_transcript_turns[existing_index]
+			if existing.get("session_id") == (session_id if not session_id.is_empty() else "unknown") \
+					and (existing.get("assistant_items", []) as Array).has(item_id):
+				turn_id = str(existing.get("turn_id", ""))
+				break
+		if turn_id.is_empty():
+			turn_id = "auto_" + item_id
+	if turn_id.begins_with("auto_"):
+		turn_number = -1                # spoken up on its own: append in time order
 	var index := _ensure_realtime_turn(turn_id, turn_number, session_id)
 	var slot: Dictionary = realtime_transcript_turns[index]
 	if role == "user":
@@ -5342,24 +5524,31 @@ func _refresh_realtime_transcript() -> void:
 		var bar := realtime_transcript_scroll.get_v_scroll_bar()
 		follow_latest = realtime_transcript_scroll.scroll_vertical + bar.page >= bar.max_value - 20.0
 	var lines: Array[String] = []
+	var entries: Array = []
 	realtime_caption_offsets.clear()
 	var character_offset := 0
 	for index in range(realtime_transcript_turns.size()):
 		var slot: Dictionary = realtime_transcript_turns[index]
 		var user_text := str(slot.get("user", ""))
-		var user_line := "אתה: " + (user_text if not user_text.is_empty() else "מתמלל…")
-		lines.append(user_line)
-		character_offset += user_line.length() + 1
+		# Miko spoke up on its own (perception/autonomy): no owner line.
+		if not str(slot.get("turn_id", "")).begins_with("auto_") or not user_text.is_empty():
+			var user_line := "אתה: " + (user_text if not user_text.is_empty() else "מתמלל…")
+			lines.append(user_line)
+			entries.append(["owner", user_text if not user_text.is_empty() else "…", ""])
+			character_offset += user_line.length() + 1
 		var answers: Array = slot.get("assistant", [])
 		var item_ids: Array = slot.get("assistant_items", [])
 		for answer_index in range(answers.size()):
 			var answer_line := "מיקו: " + str(answers[answer_index])
+			var caption_key := ""
 			if answer_index < item_ids.size():
-				var caption_key := str(slot.get("session_id", "")) + ":" + str(item_ids[answer_index])
+				caption_key = str(slot.get("session_id", "")) + ":" + str(item_ids[answer_index])
 				realtime_caption_offsets[caption_key] = Vector2i(character_offset, character_offset + answer_line.length() - 1)
 			lines.append(answer_line)
+			entries.append(["miko", str(answers[answer_index]), caption_key])
 			character_offset += answer_line.length() + 1
 	realtime_transcript_label.text = "\n".join(lines)
+	_render_realtime_bubbles(entries)
 	if realtime_transcript_scroll != null and follow_latest:
 		call_deferred("_scroll_realtime_transcript_to_bottom")
 
@@ -5382,22 +5571,18 @@ func _can_review_realtime_caption(item_id: String, session_id: String) -> bool:
 		return false
 	if realtime_voice.external_voice_active or not _realtime_caption_ui_focused():
 		return false
-	if realtime_transcript_label == null or realtime_transcript_scroll == null:
-		return false
-	if not realtime_transcript_label.is_visible_in_tree() or not realtime_transcript_scroll.is_visible_in_tree():
+	if realtime_transcript_scroll == null or not realtime_transcript_scroll.is_visible_in_tree():
 		return false
 	var caption_key := session_id + ":" + item_id
-	if not realtime_caption_offsets.has(caption_key):
+	var bubble: Label = realtime_caption_bubbles.get(caption_key)
+	if bubble == null or not is_instance_valid(bubble) or not bubble.is_visible_in_tree():
 		return false
-	var offsets: Vector2i = realtime_caption_offsets[caption_key]
-	var first := realtime_transcript_label.get_character_bounds(offsets.x)
-	var last := realtime_transcript_label.get_character_bounds(offsets.y)
-	if first.size == Vector2.ZERO or last.size == Vector2.ZERO:
+	# The whole bubble (complete address and body) must lie inside the
+	# visible conversation area, laid out with real size.
+	var rect := bubble.get_global_rect()
+	if rect.size.x < 4.0 or rect.size.y < 4.0 or bubble.get_visible_line_count() < bubble.get_line_count():
 		return false
-	first.position += realtime_transcript_label.global_position
-	last.position += realtime_transcript_label.global_position
-	var viewport_rect := realtime_transcript_scroll.get_global_rect()
-	return viewport_rect.encloses(first) and viewport_rect.encloses(last)
+	return realtime_transcript_scroll.get_global_rect().encloses(rect)
 
 
 func _realtime_caption_ui_focused() -> bool:
@@ -5405,6 +5590,8 @@ func _realtime_caption_ui_focused() -> bool:
 
 
 func _scroll_realtime_transcript_to_bottom() -> void:
+	# Bubbles get their final height a frame or two after their text changes.
+	await get_tree().process_frame
 	await get_tree().process_frame
 	if realtime_transcript_scroll == null or not is_instance_valid(realtime_transcript_scroll):
 		return
@@ -5437,3 +5624,70 @@ func _on_realtime_tool(name: String, result: Variant) -> void:
 	if name == "miko_set_expression" and result is Dictionary:
 		_set_face_emotion(str(result.get("emotion", "curious")), 8.0)
 		_play_brain_action(str(result.get("action", "look")))
+	if name == "miko_perform_action" and result is Dictionary and result.get("ok", false):
+		_perform_body_command(str(result.get("action", "")), int(result.get("times", 1)))
+
+
+# Camera: perception runs locally in the host; Godot only gets derived facts.
+func _on_realtime_vision(event: Dictionary) -> void:
+	if str(event.get("type", "")) == "vision_status":
+		vision_enabled = bool(event.get("enabled", false))
+		vision_available = bool(event.get("available", false)) and str(event.get("source", "off")) != "off"
+		vision_error = str(event.get("error", ""))
+		_refresh_camera_button()
+		return
+	if str(event.get("type", "")) == "vision_event" and realtime_status_label != null:
+		# Only noteworthy things, and never over the conversation status line.
+		var noticed := {"wave": "נפנוף", "arrived": "חזרת", "covered": "המצלמה מכוסה", "uncovered": "רואה שוב",
+			"shake_started": "טלטול", "shaken": "טלטול", "orientation_changed": "הפכו אותי"}
+		var label := str(noticed.get(str(event.get("event", "")), ""))
+		var level := str(event.get("level", "ANIMATION_ONLY"))
+		if not label.is_empty() and level not in ["NO_REACTION", "MICRO", "FACIAL"] and not _interaction_busy():
+			realtime_status_label.text = "מיקו שם לב: " + label
+	var character := get_node_or_null("MikoScene")
+	if character != null and character.has_method("on_vision"):
+		character.call("on_vision", event)
+
+
+func _toggle_vision() -> void:
+	if miko_preview_mode or realtime_voice == null:
+		return
+	vision_enabled = not vision_enabled
+	realtime_voice.set_vision_enabled(vision_enabled)
+	if not vision_enabled:
+		_on_realtime_vision({"type": "vision", "seen": false})
+	_refresh_camera_button()
+
+
+func _refresh_camera_button() -> void:
+	if realtime_camera_button == null:
+		return
+	var watching := vision_enabled and vision_available
+	if watching:
+		realtime_camera_button.text = "מצלמה"
+	elif vision_enabled and vision_error == "opencv_missing":
+		realtime_camera_button.text = "חסר OpenCV"
+	elif vision_enabled and vision_error == "webcam_unavailable":
+		realtime_camera_button.text = "אין גישה למצלמה"
+	elif vision_enabled:
+		realtime_camera_button.text = "מצלמה…"      # starting
+	else:
+		realtime_camera_button.text = "מצלמה כבויה"
+	realtime_camera_button.tooltip_text = "F7: הפעל/כבה את הראייה של מיקו (מעובד רק במחשב הזה)"
+	if vision_error == "opencv_missing":
+		realtime_camera_button.tooltip_text += "\nהרץ את Check Miko Camera.cmd כדי להתקין"
+	elif vision_error == "webcam_unavailable":
+		realtime_camera_button.tooltip_text += "\nהמצלמה תפוסה באפליקציה אחרת או חסומה בהגדרות הפרטיות של Windows"
+	_style_voice_button(realtime_camera_button, Color(0.12, 0.32, 0.26, 1.0) if watching else Color(0.20, 0.20, 0.24, 1.0))
+
+
+# Voice-commanded body actions ("תלך", "תקפוץ", "תעשה שלום") go straight to
+# a character that implements perform_command(); older avatars fall back to
+# the nearest animation cue.
+func _perform_body_command(action: String, times: int) -> void:
+	var character := get_node_or_null("MikoScene")
+	if character != null and character.has_method("perform_command"):
+		character.call("perform_command", action, times)
+		return
+	var fallback := {"jump": "bounce", "wave": "wave", "dance": "dance", "spin": "roll", "sleep": "sleep", "laugh": "laugh"}
+	_play_brain_action(str(fallback.get(action, "look")))

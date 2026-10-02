@@ -1,5 +1,6 @@
 class_name MikoRealtimeVoice
 extends Node
+const MikoLog = preload("res://miko_log.gd")
 
 signal status_changed(status: String, detail: String)
 signal transcript(role: String, text: String, turn_id: String, turn_number: int, session_id: String, item_id: String)
@@ -8,6 +9,9 @@ signal final_transcript(item_id: String, session_id: String)
 signal speaking_changed(active: bool)
 signal tool_result(name: String, result: Variant)
 signal external_voice_changed(active: bool)
+## Local camera perception from the host: "vision" (where the owner is),
+## "vision_event" (wave/arrived/left/approached) and "vision_status".
+signal vision_update(event: Dictionary)
 
 const RELAY_URL := "ws://127.0.0.1:5001/voice"
 const MIC_BUS := "MikoRealtimeMic"
@@ -67,6 +71,10 @@ var _playback: AudioStreamGeneratorPlayback
 var _pending_frames := PackedVector2Array()
 var _queued_audio_items: Array[Dictionary] = []
 var _speaker_active := false
+## Safety net: speech whose completion marker never arrives (a cancelled or
+## failed response) must not leave Miko "speaking" forever.
+const STALLED_SPEECH_MS := 4000
+var _last_audio_msec := 0
 var _remote_audio_done := false
 var _current_item_id := ""
 var _current_content_index := 0
@@ -97,6 +105,7 @@ func _process(_delta: float) -> void:
 	_feed_playback()
 	_report_playback(false)
 	_maybe_finish_playback()
+	_release_stalled_speech(Time.get_ticks_msec())
 
 
 func configure(new_mode: String) -> void:
@@ -352,6 +361,8 @@ func _handle_event(event: Dictionary) -> void:
 			_set_external_voice(bool(event.get("active", false)))
 		"tool_result":
 			tool_result.emit(str(event.get("name", "")), event.get("result"))
+		"vision", "vision_event", "vision_status":
+			vision_update.emit(event)
 		"error":
 			status_changed.emit("error", str(event.get("message", "Voice relay error")))
 			if bool(event.get("retryable", false)):
@@ -608,7 +619,23 @@ func _clear_capture() -> void:
 	_has_source_sample = false
 
 
+func _release_stalled_speech(now: int) -> void:
+	if not _speaker_active or external_voice_active or now - _last_audio_msec < STALLED_SPEECH_MS:
+		return
+	if not _pending_frames.is_empty():
+		return
+	if _playback != null and _playback.get_frames_available() < _generator_capacity:
+		return                          # still draining what was received
+	if not _current_item_id.is_empty():
+		_remote_audio_done = true
+		_maybe_finish_playback()
+	if _speaker_active:
+		_clear_playback()
+		status_changed.emit("ready", "Listening")
+
+
 func _receive_audio(event: Dictionary) -> void:
+	_last_audio_msec = Time.get_ticks_msec()
 	var item_id := str(event.get("item_id", ""))
 	var content_index := int(event.get("content_index", 0))
 	var bytes := Marshalls.base64_to_raw(str(event.get("audio", "")))
@@ -841,3 +868,24 @@ func _fail_transport(message: String) -> void:
 	status_changed.emit("error", message)
 	if _socket != null and _socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		_socket.close(1011, "Voice transport stalled")
+
+
+## Deterministic exit from any turn state (watchdog/backstop): stop the
+## microphone, drop pending input and playback, and become ready again.
+func recover(reason: String) -> void:
+	MikoLog.info("RECOVERY", "voice client reset", {"reason": reason, "turn_pending": _turn_pending,
+		"capture": _capture_active, "speaking": _speaker_active, "remote_ready": _remote_ready})
+	if _remote_start_sent:
+		_send({"type": "stop"})
+	_remote_start_sent = false
+	_capture_active = false
+	_turn_pending = false
+	_ptt_finalizing = false
+	_pending_input.clear()
+	_clear_capture()
+	_clear_playback()
+	status_changed.emit("idle", "Ready")
+
+
+func set_vision_enabled(enabled: bool) -> void:
+	_send({"type": "vision_toggle", "enabled": enabled})

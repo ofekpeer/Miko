@@ -22,6 +22,10 @@ from device.bridge import BridgeSettings, DeviceBridge, DeviceConfigError, Devic
 from device.protocol import (
     decode_downlink_pcm,
     encode_camera_jpeg,
+    encode_motion_imu,
+    decode_motion_imu,
+    encode_vision_jpeg,
+    ProtocolError,
     encode_uplink_pcm,
     new_nonce,
     pairing_proof,
@@ -39,10 +43,24 @@ def _openssl() -> str | None:
     )
 
 
+class _FakeVision:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.frames: list[bytes] = []
+        self.motion: list = []
+
+    def feed_jpeg(self, jpeg: bytes) -> None:
+        self.frames.append(jpeg)
+
+    def feed_imu(self, samples) -> None:
+        self.motion.extend(samples)
+
+
 class _FakeHub:
     def __init__(self) -> None:
         self.native: set = set()
         self.browser_id = None
+        self.vision = _FakeVision()
 
 
 class _FakeNative:
@@ -125,6 +143,21 @@ class DeviceBridgeTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_motion_frames_round_trip_and_reject_malformed(self) -> None:
+        frame = encode_motion_imu(7, 5000, [(0, 10, -20, 1000, 15, -15, 0), (10, 0, 0, 980, 0, 0, 1234)])
+        sequence, samples = decode_motion_imu(frame)
+        self.assertEqual(sequence, 7)
+        self.assertEqual(samples[1], (5.01, 0.0, 0.0, 0.98, 0.0, 0.0, 123.4))
+        with self.assertRaises(ProtocolError):
+            decode_motion_imu(frame[:-1])
+        with self.assertRaises(ProtocolError):
+            encode_motion_imu(1, 0, [])
+        with self.assertRaises(ProtocolError):
+            encode_motion_imu(1, 0, [(0, 99999, 0, 0, 0, 0, 0)])
+        backwards = encode_motion_imu(1, 0, [(10, 0, 0, 0, 0, 0, 0), (5, 0, 0, 0, 0, 0, 0)])
+        with self.assertRaises(ProtocolError):
+            decode_motion_imu(backwards)
+
     def test_listener_is_opt_in_and_rejects_public_bind(self) -> None:
         with tempfile.TemporaryDirectory(prefix="miko_device_config_") as directory:
             path = Path(directory) / "settings.json"
@@ -161,7 +194,7 @@ class DeviceBridgeTests(unittest.TestCase):
                 "tls_cert": str(cert), "tls_key": str(key),
                 "paired_devices": [{
                     "device_id": "miko_s3", "pairing_secret_b64": base64.b64encode(secret).decode("ascii"),
-                    "capabilities": ["audio", "display", "gesture", "camera"],
+                    "capabilities": ["audio", "display", "gesture", "camera", "vision", "motion"],
                 }],
             }), encoding="utf-8")
             hub = _FakeHub()
@@ -216,6 +249,54 @@ class DeviceBridgeTests(unittest.TestCase):
                     jpeg = b"\xff\xd8temporary-test-image\xff\xd9"
                     await device.send(encode_camera_jpeg(requested["request_id"], jpeg))
                     self.assertEqual(await snapshot, jpeg)
+
+                # Perception frames: only after the server asks, rate bounded,
+                # and stopped by the owner's camera toggle.
+                async with connect(url, ssl=tls) as seeing:
+                    challenge = json.loads(await seeing.recv())
+                    nonce = new_nonce()
+                    await seeing.send(json.dumps({
+                        "type": "authenticate", "device_id": "miko_s3", "client_nonce": nonce,
+                        "proof": pairing_proof(secret, "miko_s3", challenge["server_nonce"], nonce),
+                        "capabilities": ["audio", "vision"],
+                    }))
+                    self.assertTrue(json.loads(await seeing.recv())["resumed"])
+                    messages = [json.loads(await seeing.recv()) for _ in range(2)]
+                    stream = next(m for m in messages if m["type"] == "vision_stream")
+                    self.assertTrue(stream["active"])
+                    self.assertLessEqual(stream["fps"], 6)
+                    frame = b"\xff\xd8small-frame\xff\xd9"
+                    for i in range(5):                       # a burst: most are dropped
+                        await seeing.send(encode_vision_jpeg(i, frame))
+                    await asyncio.sleep(0.2)
+                    self.assertGreaterEqual(len(hub.vision.frames), 1)
+                    self.assertLess(len(hub.vision.frames), 5)
+                    hub.vision.enabled = False
+                    await bridge.set_vision_stream()
+                    self.assertEqual(json.loads(await seeing.recv()), {"type": "vision_stream", "active": False})
+                    await seeing.send(encode_vision_jpeg(9, frame))
+                    with self.assertRaises(ConnectionClosed):
+                        await asyncio.wait_for(seeing.recv(), 2)
+                    hub.vision.enabled = True
+
+                # IMU motion: only with the motion capability, bounded rate.
+                async with connect(url, ssl=tls) as moving:
+                    challenge = json.loads(await moving.recv())
+                    nonce = new_nonce()
+                    await moving.send(json.dumps({
+                        "type": "authenticate", "device_id": "miko_s3", "client_nonce": nonce,
+                        "proof": pairing_proof(secret, "miko_s3", challenge["server_nonce"], nonce),
+                        "capabilities": ["audio", "motion"],
+                    }))
+                    self.assertIn("motion", json.loads(await moving.recv())["capabilities"])
+                    batch = [(i * 10, 0, 0, 1000, 3000 if i % 2 else -3000, 0, 0) for i in range(20)]
+                    for i in range(15):                     # 300 samples in a burst: rate bounded
+                        await moving.send(encode_motion_imu(i, 1000 + i * 200, batch))
+                    await asyncio.sleep(0.3)
+                    self.assertGreaterEqual(len(hub.vision.motion), 20)
+                    self.assertLessEqual(len(hub.vision.motion), 200)
+                    self.assertAlmostEqual(hub.vision.motion[0][3], 1.0)        # az in g
+                    self.assertAlmostEqual(abs(hub.vision.motion[0][4]), 300.0)  # gyro in deg/s
 
                 # The same authenticated device resumes one logical session.
                 async with connect(url, ssl=tls) as resumed_device:
@@ -307,7 +388,7 @@ class DeviceBridgeTests(unittest.TestCase):
                 output = root / "speaker.wav"
                 args = argparse.Namespace(
                     url=url, ca=str(cert), device_id="miko_s3", secret_file=str(secret_file),
-                    speaker=False, wav_out=str(output), camera_file=None,
+                    speaker=False, wav_out=str(output), camera_file=None, vision_file=None,
                     text="test", wav_in=None, mic_seconds=None, wait_seconds=2,
                 )
                 await run_simulator(args)

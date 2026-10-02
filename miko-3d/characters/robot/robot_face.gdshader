@@ -26,6 +26,10 @@ uniform float mouth_smile = 0.35;     // -1 frown .. 1 smile
 uniform float mouth_visible = 1.0;
 uniform vec2 eye_center = vec2(0.20, 0.50);   // offset of each eye from the middle (x * aspect units, y down)
 uniform float mouth_y = 0.71;
+// The split-out screen mesh has a ragged outline; trim it to a clean
+// rounded rectangle (in face units) so the visor edge is one smooth line.
+uniform vec2 screen_half = vec2(0.66, 0.50);
+uniform float screen_radius = 0.30;
 
 float sd_round_box(vec2 p, vec2 b, float r) {
 	vec2 q = abs(p) - b + r;
@@ -84,25 +88,30 @@ float mouth(vec2 p, vec2 c) {
 
 void fragment() {
 	vec2 p = vec2(UV.x * aspect, UV.y);           // y grows downward (glTF/Godot UV)
+	float outline = sd_round_box(p - vec2(0.5 * aspect, 0.5), screen_half, screen_radius);
+	if (outline > 0.0) {
+		discard;
+	}
 	vec2 middle = vec2(0.5 * aspect, 0.0);
 	vec2 look = gaze * vec2(0.055, -0.040);
 	float d_left = eye(p, middle + vec2(-eye_center.x, eye_center.y) + look, eye_open_l, -1.0);
 	float d_right = eye(p, middle + vec2(eye_center.x, eye_center.y) + look, eye_open_r, 1.0);
 	float d_mouth = mouth(p, middle + vec2(0.0, mouth_y) + look * 0.35);
-	float aa = fwidth(p.x) * 1.4;
+	float aa = max(fwidth(p.x), fwidth(p.y)) * 1.5;
 	float eyes = 1.0 - smoothstep(-aa, aa, min(d_left, d_right));
 	float mouth_fill = (1.0 - smoothstep(-aa, aa, d_mouth)) * mouth_visible;
 	float nearest = min(min(d_left, d_right), mix(1.0, d_mouth, mouth_visible));
 	float glow = exp(-max(nearest, 0.0) * 42.0) * 0.38;
-	float stripes = 0.80 + 0.20 * step(0.45, fract(p.x * 58.0));
-	float lit = (max(eyes, mouth_fill) * stripes + glow) * power;
+	// Solid, smooth shapes: fine stripes/scanlines aliased into shimmer as
+	// the head moved, so the "screen" feel comes from glow and a soft core.
+	float core = 1.0 - 0.18 * smoothstep(-0.03, 0.0, min(min(d_left, d_right), mix(1.0, d_mouth, mouth_visible)));
+	float lit = (max(eyes, mouth_fill) * core + glow) * power;
 	// Self-lit display: lamps and the helmet brim's shadow never touch it, so
 	// no jagged highlight can cover the face. A fixed sheen and a soft edge
 	// fresnel keep it reading as curved glass.
-	float scan = 0.94 + 0.06 * sin(UV.y * 420.0);
 	float fresnel = pow(1.0 - clamp(abs(dot(NORMAL, VIEW)), 0.0, 1.0), 3.0);
 	vec2 s = UV - vec2(0.30, 0.16);
 	float sheen = exp(-dot(s * vec2(2.2, 7.0), s * vec2(2.2, 7.0))) * 0.10;
-	vec3 glass = glass_color * scan + vec3(0.55, 0.65, 0.75) * (fresnel * 0.22 + sheen);
+	vec3 glass = glass_color + vec3(0.55, 0.65, 0.75) * (fresnel * 0.22 + sheen);
 	ALBEDO = glass + face_color * brightness * lit;
 }

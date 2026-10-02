@@ -67,6 +67,7 @@ def main() -> int:
         print("Godot was not found. Open miko-3d/project.godot in Godot and press F5.")
         input("Press Enter to close...")
         return 1
+    start_miko.ensure_imported(exe, NEW_PROJECT)
     log_dir = start_miko.root / "miko_logs"
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / ("godot_17_3_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
